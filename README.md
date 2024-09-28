@@ -2,7 +2,7 @@
 
 ### A simple and user-friendly GUI tool to download character cards from Chub.ai using the API.
 
-![Chub.ai Card Downloader](path_to_screenshot.png)
+![Chub.ai Card Downloader](https://github.com/Samueras/chub_downloader/blob/main/screenshots/gui.png)
 
 ## **Table of Contents**
 - [Features](#features)
@@ -20,6 +20,7 @@
 - HTML reports generated for each card, including descriptions and additional card information.
 - Automatically download related gallery images.
 - GUI built with **Tkinter** and **ttkbootstrap** for a modern look.
+![](https://github.com/Samueras/chub_downloader/blob/main/screenshots/html.png)
 
 ## **Installation**
 
@@ -94,4 +95,4 @@ If you'd like to contribute, please fork the repository and make changes as you'
 
 ## **License**
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the [[LICENSE](LICENSE)](https://github.com/Samueras/chub_downloader#) file for details.
