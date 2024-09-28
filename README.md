@@ -1,7 +1,3 @@
-Here is a sample **GitHub README** file for your project:
-
----
-
 # **Chub.ai Card Downloader**
 
 ### A simple and user-friendly GUI tool to download character cards from Chub.ai using the API.
@@ -99,11 +95,3 @@ If you'd like to contribute, please fork the repository and make changes as you'
 ## **License**
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-### **Additional Notes:**
-- Replace `"path_to_screenshot.png"` with a valid path if you want to include a screenshot of the app.
-- Ensure that you remove or hide any sensitive information like tokens in the code or config files.
-
-This README should help guide users on how to install, use, and contribute to the **Chub.ai Card Downloader** project!
