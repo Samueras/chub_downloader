@@ -3,7 +3,6 @@ import json
 import os
 import configparser
 from io import BytesIO
-from PIL import Image
 import zipfile
 import markdown  # For markdown conversion
 
@@ -11,6 +10,13 @@ import markdown  # For markdown conversion
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from tkinter import messagebox, filedialog
+import threading
+import logging
+import re  # Import regular expressions module
+
+# Configure logging
+logging.basicConfig(filename='error.log', level=logging.ERROR, 
+                    format='%(asctime)s:%(levelname)s:%(message)s')
 
 # Define the highlight color
 highlight_color = '#859412'
@@ -20,7 +26,7 @@ app = ttk.Window(
     title="Chub.ai Card Downloader",
     themename="journal"
 )
-app.geometry("500x240")  # Adjusted height for new button
+app.geometry("500x300")  # Increased height for status bar
 
 style = ttk.Style()
 style.configure('TLabel', font=('Segoe UI', 11))
@@ -61,7 +67,21 @@ def save_config():
     with open(config_file, 'w') as configfile:
         config.write(configfile)
 
+def sanitize_filename(name):
+    """
+    Removes invalid characters from filenames and directory names.
+    """
+    # Remove invalid characters for Windows filenames
+    invalid_chars = r'<>:"/\\|?*'
+    sanitized_name = re.sub(f'[{re.escape(invalid_chars)}]', '', name)
+    # Remove trailing spaces and periods
+    sanitized_name = sanitized_name.rstrip('. ')
+    return sanitized_name
+
 def set_api_token():
+    """
+    Opens a new window to set the Chub.ai Token with an option to toggle visibility.
+    """
     def toggle_token_visibility():
         if token_entry.cget('show') == '':
             token_entry.config(show='*')
@@ -75,7 +95,7 @@ def set_api_token():
         config['Settings']['api_token'] = token
         save_config()
         token_window.destroy()
-        messagebox.showinfo("Chub.ai Token Saved", "Your Chub.ai Token has been saved.")
+        messagebox.showinfo("Chub.ai Token Saved", "Your Chub.ai token has been saved.")
 
     # Create a new window
     token_window = ttk.Toplevel(app)
@@ -85,8 +105,8 @@ def set_api_token():
 
     # Explanation Label
     explanation = (
-        "To access NSFL cards or private content, you need to provide your Chub.ai Token.\n\n"
-        "How to find your Chub.ai Token:\n"
+        "To access NSFL cards or private content, you need to provide your Chub.ai token.\n\n"
+        "How to find your Chub.ai token:\n"
         "1. Open your web browser and go to chub.ai.\n"
         "2. Log in to your account.\n"
         "3. Open the browser's developer tools (usually by pressing F12).\n"
@@ -118,93 +138,93 @@ def set_api_token():
     save_button = ttk.Button(token_window, text="Save Token", command=save_token, style='Custom.TButton')
     save_button.pack(pady=(0, 10))
 
-def download_card():
-    name = entry.get().strip()
-    bundle_option = var.get()
-    output_directory = output_dir.get()
-    api_token = config['Settings'].get('api_token', '').strip()
-
-    if not name:
-        messagebox.showwarning("Input Error", "Please enter the name of the card.")
-        return
-
-    if not output_directory:
-        messagebox.showwarning("Output Directory Not Set", "Please select an output directory.")
-        return
-
-    # Headers for API requests
-    headers = {
-        'accept': 'application/json',
-        'User-Agent': 'ChubCardDownloader/1.0'
-    }
-    if api_token:
-        headers['Authorization'] = f'Bearer {api_token}'
-
-    # First API call
-    search_url = f"https://api.chub.ai/api/characters/search?search={name}&nsfw=true&nsfl=true&first=100&page=1&sort=created_at&asc=false"
-
+def download_card_thread():
+    """
+    Handles the card download process in a separate thread.
+    Provides feedback and error handling.
+    """
     try:
+        # Disable buttons during download
+        download_button.config(state=DISABLED)
+        token_button.config(state=DISABLED)
+        select_output_button.config(state=DISABLED)
+        status_var.set("Downloading card...")
+
+        name = entry.get().strip()
+        bundle_option = var.get()
+        output_directory = output_dir.get()
+        api_token = config['Settings'].get('api_token', '').strip()
+
+        if not name:
+            messagebox.showwarning("Input Error", "Please enter the name of the card.")
+            return
+
+        if not output_directory:
+            messagebox.showwarning("Output Directory Not Set", "Please select an output directory.")
+            return
+
+        # Headers for API requests
+        headers = {
+            'accept': 'application/json',
+            'User-Agent': 'ChubCardDownloader/1.0'
+        }
+        if api_token:
+            headers['Authorization'] = f'Bearer {api_token}'
+
+        # First API call: Search for the card
+        search_url = f"https://api.chub.ai/api/characters/search?search={name}&nsfw=true&nsfl=true&first=100&page=1&sort=created_at&asc=false"
+
         response = requests.get(search_url, headers=headers)
         response.raise_for_status()
-    except requests.exceptions.HTTPError as http_err:
-        error_message = f"HTTP error occurred: {http_err}\nStatus Code: {response.status_code}"
-        try:
-            error_details = response.json()
-            error_message += f"\nError Details: {error_details}"
-        except json.JSONDecodeError:
-            error_message += f"\nResponse Content: {response.text}"
-        messagebox.showerror("API Error", error_message)
-        return
-    except Exception as err:
-        messagebox.showerror("Error", f"An error occurred: {err}")
-        return
 
-    data = response.json()
+        data = response.json()
 
-    count = data.get('count', 0)
-    if count == 0:
-        if not api_token:
-            messagebox.showinfo(
-                "No Results",
-                "No card found with the given name.\n\n"
-                "If you're searching for NSFL or private cards, you may need to set your Chub.ai Token."
-            )
-        else:
-            messagebox.showinfo("No Results", "No card found with the given name.")
-        return
-    elif count > 1:
-        messagebox.showinfo("Multiple Results", "Multiple cards found. Please enter a more specific name or the card code.")
-        return
+        count = data.get('count', 0)
+        if count == 0:
+            if not api_token:
+                messagebox.showinfo(
+                    "No Results",
+                    "No card found with the given name.\n\n"
+                    "If you're searching for NSFL or private cards, you may need to set your Chub.ai token."
+                )
+            else:
+                messagebox.showinfo("No Results", "No card found with the given name.")
+            return
+        elif count > 1:
+            messagebox.showinfo("Multiple Results", "Multiple cards found. Please enter a more specific name or the card code.")
+            return
 
-    node = data['nodes'][0]
-    card_id = node['id']
-    full_path = node['fullPath']
-    description = node['description']
-    name = node['name']
+        node = data['nodes'][0]
+        card_id = node['id']
+        full_path = node['fullPath']
+        description = node['description']
+        name = node['name']
 
-    # Create output directory
-    output_dir_path = output_directory
-    if not os.path.exists(output_dir_path):
-        os.makedirs(output_dir_path)
+        # Sanitize the name for use in file paths
+        sanitized_name = sanitize_filename(name)
 
-    card_dir = os.path.join(output_dir_path, name.replace(' ', '_'))
-    if not os.path.exists(card_dir):
-        os.makedirs(card_dir)
+        # Create output directory
+        output_dir_path = output_directory
+        if not os.path.exists(output_dir_path):
+            os.makedirs(output_dir_path)
 
-    # Save description and additional information as HTML using markdown and a template
-    html_content = generate_html(node)
-    with open(os.path.join(card_dir, f"{name}_info.html"), 'w', encoding='utf-8') as f:
-        f.write(html_content)
+        card_dir = os.path.join(output_dir_path, sanitized_name)
+        if not os.path.exists(card_dir):
+            os.makedirs(card_dir)
 
-    # Second API call to download PNG
-    download_url = "https://api.chub.ai/api/characters/download"
-    payload = {
-        "format": "card_spec_v2",
-        "fullPath": full_path,
-        "version": "main"
-    }
+        # Save description and additional information as HTML using markdown and a template
+        html_content = generate_html(node)
+        with open(os.path.join(card_dir, f"{sanitized_name}_info.html"), 'w', encoding='utf-8') as f:
+            f.write(html_content)
 
-    try:
+        # Second API call to download PNG
+        download_url = "https://api.chub.ai/api/characters/download"
+        payload = {
+            "format": "card_spec_v2",
+            "fullPath": full_path,
+            "version": "main"
+        }
+
         download_headers = headers.copy()
         download_headers['accept'] = '*/*'
         download_headers['Content-Type'] = 'application/json'
@@ -212,19 +232,13 @@ def download_card():
         response = requests.post(download_url, headers=download_headers, json=payload)
         response.raise_for_status()
 
-        img = Image.open(BytesIO(response.content))
-        img.save(os.path.join(card_dir, f"{name}.png"))
-    except requests.exceptions.HTTPError as http_err:
-        messagebox.showerror("Download Error", f"HTTP error occurred while downloading PNG: {http_err}")
-        return
-    except Exception as err:
-        messagebox.showerror("Error", f"An error occurred while downloading PNG: {err}")
-        return
+        # Save the PNG file directly without using PIL to preserve metadata
+        with open(os.path.join(card_dir, f"{sanitized_name}.png"), 'wb') as img_file:
+            img_file.write(response.content)
 
-    # Third API call to get gallery images
-    gallery_url = f"https://api.chub.ai/api/gallery/project/{card_id}?nsfw=true&page=1&limit=24"
+        # Third API call to get gallery images
+        gallery_url = f"https://api.chub.ai/api/gallery/project/{card_id}?nsfw=true&page=1&limit=24"
 
-    try:
         response = requests.get(gallery_url, headers=headers)
         response.raise_for_status()
 
@@ -237,34 +251,53 @@ def download_card():
                 image_response = requests.get(image_url)
                 if image_response.status_code == 200:
                     image_name = image_url.split('/')[-1]
-                    with open(os.path.join(card_dir, image_name), 'wb') as img_file:
+                    sanitized_image_name = sanitize_filename(image_name)
+                    with open(os.path.join(card_dir, sanitized_image_name), 'wb') as img_file:
                         img_file.write(image_response.content)
+                else:
+                    logging.error(f"Failed to download gallery image: {image_url}")
         else:
             messagebox.showinfo("Gallery Info", "No gallery images found.")
-    except requests.exceptions.HTTPError as http_err:
-        messagebox.showerror("Gallery Error", f"HTTP error occurred while fetching gallery images: {http_err}")
-        return
-    except Exception as err:
-        messagebox.showerror("Error", f"An error occurred while fetching gallery images: {err}")
-        return
 
-    # Bundle option
-    if bundle_option == 'Zip':
-        zipf = zipfile.ZipFile(f"{card_dir}.zip", 'w', zipfile.ZIP_DEFLATED)
-        for root, dirs, files in os.walk(card_dir):
-            for file in files:
-                zipf.write(os.path.join(root, file), arcname=file)
-        zipf.close()
-        # Remove the folder if zipped
-        for root, dirs, files in os.walk(card_dir, topdown=False):
-            for file in files:
-                os.remove(os.path.join(root, file))
-            os.rmdir(root)
-        messagebox.showinfo("Success", f"All files have been saved and zipped at {card_dir}.zip")
-    else:
-        messagebox.showinfo("Success", f"All files have been saved in {card_dir}")
+        # Bundle option
+        if bundle_option == 'Zip':
+            zipf = zipfile.ZipFile(f"{card_dir}.zip", 'w', zipfile.ZIP_DEFLATED)
+            for root, dirs, files in os.walk(card_dir):
+                for file in files:
+                    zipf.write(os.path.join(root, file), arcname=file)
+            zipf.close()
+            # Remove the folder if zipped
+            for root, dirs, files in os.walk(card_dir, topdown=False):
+                for file in files:
+                    os.remove(os.path.join(root, file))
+                os.rmdir(root)
+            messagebox.showinfo("Success", f"All files have been saved and zipped at {card_dir}.zip")
+        else:
+            messagebox.showinfo("Success", f"All files have been saved in {card_dir}")
+
+    except requests.exceptions.HTTPError as http_err:
+        logging.error(f"HTTP error occurred: {http_err}")
+        messagebox.showerror("HTTP Error", f"An HTTP error occurred: {http_err}")
+    except Exception as err:
+        logging.error(f"An error occurred: {err}")
+        messagebox.showerror("Error", f"An error occurred: {err}")
+    finally:
+        # Re-enable buttons after download
+        download_button.config(state=NORMAL)
+        token_button.config(state=NORMAL)
+        select_output_button.config(state=NORMAL)
+        status_var.set("Ready")
+
+def download_card():
+    """
+    Initiates the download process in a separate thread.
+    """
+    threading.Thread(target=download_card_thread).start()
 
 def generate_html(node):
+    """
+    Generates an HTML file with card information and description.
+    """
     # Convert markdown description to HTML
     description_html = markdown.markdown(node.get('description', ''))
 
@@ -288,7 +321,7 @@ def generate_html(node):
         'Name': node.get('name', ''),
         'ID': node.get('id', ''),
         'Full Path': node.get('fullPath', ''),
-        'Downloads': node.get('starCount', ''),  # Changed label from 'Stars' to 'Downloads'
+        'Downloads': node.get('starCount', ''),
         'Last Activity': node.get('lastActivityAt', ''),
         'Created At': node.get('createdAt', ''),
         'Tags': ', '.join(node.get('topics', [])),
@@ -441,10 +474,10 @@ def generate_html(node):
     for key, value in fields.items():
         if key not in ['Name', 'Description', 'Avatar URL']:
             html_template += f"""
-                    <li>
-                        <strong>{key}:</strong>
-                        <span>{value}</span>
-                    </li>
+                        <li>
+                            <strong>{key}:</strong>
+                            <span>{value}</span>
+                        </li>
             """
 
     html_template += """
@@ -461,10 +494,10 @@ def generate_html(node):
         """
         for key, value in token_counts.items():
             html_template += f"""
-                    <li>
-                        <strong>{key}:</strong>
-                        <span>{value}</span>
-                    </li>
+                        <li>
+                            <strong>{key}:</strong>
+                            <span>{value}</span>
+                        </li>
             """
         html_template += """
                 </ul>
@@ -539,6 +572,11 @@ token_button.grid(row=3, column=0, columnspan=3, sticky=EW, pady=(10, 0))
 # Download Button
 download_button = ttk.Button(frame, text="Download Card", command=download_card, style='Custom.TButton')
 download_button.grid(row=4, column=0, columnspan=3, sticky=EW, pady=(10, 0))
+
+# Status Bar
+status_var = ttk.StringVar(value="Ready")
+status_bar = ttk.Label(app, textvariable=status_var, relief=SUNKEN, anchor=W, font=('Segoe UI', 10))
+status_bar.pack(side=BOTTOM, fill=X)
 
 # Run the application
 app.mainloop()
