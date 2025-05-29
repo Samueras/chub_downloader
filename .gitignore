@@ -48,6 +48,12 @@ coverage.xml
 *.cover
 *.py,cover
 .hypothesis/
+
+# Application-specific logs
+error.log
+
+# Configuration files with secrets
+config.ini
 .pytest_cache/
 cover/
 
