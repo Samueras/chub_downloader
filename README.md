@@ -1,73 +1,70 @@
-# **Chub.ai Card Downloader**
+# Chub.ai Card Downloader
 
-### A simple and user-friendly GUI tool to download character cards from Chub.ai using the API.
+A simple yet powerful GUI application for downloading character cards from [Chub.ai](https://chub.ai/).
 
-![Chub.ai Card Downloader](https://github.com/Samueras/chub_downloader/blob/main/screenshots/gui.png)
+![GUI Screenshot](https://github.com/Samueras/chub_downloader/blob/main/screenshots/gui.png)
 
-## **Table of Contents**
-- [Features](#features)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Creating Executable](#creating-executable)
-- [Configuration](#configuration)
-- [Contributing](#contributing)
-- [License](#license)
+## **Usage (Recommended)**
+
+For most users, the simplest way to use this tool is by downloading the standalone executable (`.exe`) from the project's **Releases** page.
+
+1.  Go to the [Releases Page](https://github.com/Samueras/chub_downloader/releases).
+2.  Download the latest `chub_card_downloader.exe` file.
+3.  Run the application. No installation is needed.
 
 ## **Features**
-- Download character cards from Chub.ai by simply entering the card name.
-- Option to bundle downloaded files as a folder or zip archive.
-- Easily set and manage your Chub.ai Token for accessing restricted content.
-- HTML reports generated for each card, including descriptions and additional card information.
-- Automatically download related gallery images.
-- GUI built with **Tkinter** and **ttkbootstrap** for a modern look.
-![](https://github.com/Samueras/chub_downloader/blob/main/screenshots/html.png)
 
-## **Installation**
+-   **Download by URL or Path**: Directly download a card using its full Chub.ai URL or its unique path (e.g., `p1a_gura`).
+-   **Simple & Advanced Search**: A powerful search window lets you find cards by name or with a wide range of filters, including:
+    -   Sorting by popularity, creation date, rating, and more.
+    -   Filtering by tags, creator, token count, and age.
+    -   Quick presets for "Latest", "Trending", and "Recent Hits".
+-   **Detailed Output**: Saves all card assets, including the main image, gallery images, and character data (`.json`).
+-   **HTML Overview**: Generates an HTML file for a quick and comprehensive offline overview of the card.
+-   **Token Support**: Add your Chub.ai API token to access restricted or private content.
+-   **Persistent Settings**: Remembers your output directory, bundle option, and advanced search filters between sessions.
 
-### **Requirements**
-1. **Python 3.x**
-2. Install the following dependencies:
-   ```bash
-   pip install requests Pillow markdown ttkbootstrap
-   ```
+![HTML Report Screenshot](https://github.com/Samueras/chub_downloader/blob/main/screenshots/html.png)
 
-### **Clone the Repository**
+## **Setting Your Chub.ai Token**
+
+To access restricted cards (NSFW/NSFL) or private content, you may need to provide your API token.
+
+1.  Click the **Set Chub.ai Token** button in the app.
+2.  Log in to [Chub.ai](https://chub.ai/).
+3.  Open your browser's developer tools (usually `F12`).
+4.  Navigate to the `Application` tab -> `Local Storage` -> `chub.ai`.
+5.  Find the `URQL_TOKEN` key, copy its value, and paste it into the token field in the app.
+
+## **Usage (for Developers)**
+
+If you want to run the script directly or modify it, follow these steps.
+
+### **Installation**
+
+Clone the repository and install the dependencies:
 ```bash
-git clone https://github.com/yourusername/chub-card-downloader.git
-cd chub-card-downloader
+git clone https://github.com/Samueras/chub_downloader.git
+cd chub_downloader
+pip install -r requirements.txt
 ```
 
-## **Usage**
-
 ### **Running the Script**
-You can run the downloader directly by executing the Python script:
+
 ```bash
 python chub_card_downloader.py
 ```
 
-### **Features in the GUI**
-1. **Card Name**: Enter the name of the character card you wish to download.
-2. **Bundle Option**: Choose whether to download the files as a folder or as a zip archive.
-3. **Output Directory**: Select the location where the files will be saved.
-4. **Set Chub.ai Token**: (Optional) Add your Chub.ai Token for accessing restricted cards (NSFW/NSFL or private content).
+### **Creating an Executable**
 
-#### **How to Find Your Chub.ai Token**
-1. Log in to [Chub.ai](https://chub.ai/).
-2. Open the developer tools (usually by pressing `F12`).
-3. Navigate to the `Application` tab.
-4. Look under **Local Storage** for the `URQL_TOKEN` key.
-5. Copy its value and paste it into the Chub.ai Token field in the app.
-
-## **Creating Executable**
-
-You can convert this Python script into a standalone executable using **PyInstaller**.
+This project uses **PyInstaller** to create the standalone executable.
 
 First, install PyInstaller:
 ```bash
 pip install pyinstaller
 ```
 
-Then, generate the executable with the following command:
+Then, generate the executable:
 ```bash
 pyinstaller --onefile --windowed chub_card_downloader.py
 ```
@@ -76,23 +73,18 @@ The `.exe` file will be located in the `dist/` folder.
 
 ## **Configuration**
 
-The app automatically creates a `config.ini` file in the same directory as the script. This file stores:
-- The last used output directory.
-- The bundle option (Folder or Zip).
-- Your Chub.ai Token (if provided).
+The app automatically creates a `config.ini` file to store your settings, including your last used output directory, bundle option, API token, and advanced search filters.
 
-You can modify this file manually if necessary.
+## **Support**
+
+If you find this tool useful, please consider supporting its development:
+
+[<img src="https://storage.ko-fi.com/cdn/kofi2.png?v=3" alt="Ko-fi" height="36">](https://ko-fi.com/samueras)
 
 ## **Contributing**
 
-If you'd like to contribute, please fork the repository and make changes as you'd like. Pull requests are warmly welcome.
-
-1. Fork the repository.
-2. Create a new branch: `git checkout -b my-branch-name`.
-3. Make your changes.
-4. Push to the branch: `git push origin my-branch-name`.
-5. Submit a pull request.
+Contributions are welcome! Please feel free to submit a pull request or open an issue.
 
 ## **License**
 
-This project is licensed under the MIT License - see the [[LICENSE](LICENSE)](https://github.com/Samueras/chub_downloader#) file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

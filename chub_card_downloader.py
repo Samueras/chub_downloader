@@ -15,6 +15,7 @@ import logging
 import re  # Import regular expressions module
 import tkinter as tk # For Canvas widget
 from PIL import Image, ImageTk
+import queue
 
 # Determine application path for PyInstaller compatibility
 import sys
@@ -94,8 +95,8 @@ def _check_card_rating_api(full_path_query, target_card_id, min_rating_to_check,
     try:
         response = requests.get(search_url, headers=headers, timeout=15)
         response.raise_for_status()
-        data = response.json()
-        nodes = data.get('data', {}).get('nodes', [])
+        initial_response = response.json()
+        nodes = initial_response.get('data', {}).get('nodes', [])
         for node_item in nodes:
             if node_item.get('id') == target_card_id:
                 return True
@@ -110,6 +111,9 @@ def _check_card_rating_api(full_path_query, target_card_id, min_rating_to_check,
 def determine_ai_rating(selected_node_data, headers, status_var=None):
     """Determines the AI rating of a card using binary search on the search API."""
     full_path = selected_node_data.get('fullPath')
+    # Fallback for direct API calls that might use 'path' instead of 'fullPath'
+    if not full_path and 'path' in selected_node_data:
+        full_path = selected_node_data['path']
     target_card_id = selected_node_data.get('id')
 
     if not full_path or target_card_id is None:
@@ -226,234 +230,564 @@ def set_api_token():
     save_button = ttk.Button(token_window, text="Save Token", command=save_token, style='Custom.TButton')
     save_button.pack(pady=(0, 10))
 
-
-class CardSelectionPopup(ttk.Toplevel):
-    def __init__(self, parent, cards_data):
+class AdvancedSearchPopup(tk.Toplevel):
+    def __init__(self, parent, headers):
         super().__init__(parent)
-        self.title("Select a Card")
-        self.geometry("650x550") # Adjusted size
+        self.title("Advanced Search")
         self.parent = parent
-        self.cards_data = cards_data
+        self.headers = headers
         self.selected_card_node = None
-        self.scrollable_frame = None # Initialize scrollable_frame
-        self.select_buttons = [] # To store select buttons
-        # self.style = app_style # This line is removed as it's not needed and causes the error
 
-        # Make the popup modal
-        self.transient(parent) # Set to be on top of the parent
-        self.grab_set() # Direct all events to this window
+        # Load filters from config
+        if not config.has_section('AdvancedSearch'):
+            config.add_section('AdvancedSearch')
+        
+        self.search_query_var = tk.StringVar(value=entry.get()) # Carry over search query
+        self.sort_by_var = tk.StringVar(value=config.get('AdvancedSearch', 'sort_by', fallback='download_count'))
+        self.sort_asc_var = tk.BooleanVar(value=config.getboolean('AdvancedSearch', 'sort_asc', fallback=False))
+        self.nsfw_var = tk.BooleanVar(value=config.getboolean('AdvancedSearch', 'nsfw', fallback=True))
+        self.nsfl_var = tk.BooleanVar(value=config.getboolean('AdvancedSearch', 'nsfl', fallback=False))
+        self.min_tokens_var = tk.StringVar(value=config.get('AdvancedSearch', 'min_tokens', fallback=''))
+        self.max_tokens_var = tk.StringVar(value=config.get('AdvancedSearch', 'max_tokens', fallback=''))
+        self.max_days_ago_var = tk.StringVar(value=config.get('AdvancedSearch', 'max_days_ago', fallback=''))
+        self.creator_id_var = tk.StringVar(value=config.get('AdvancedSearch', 'creator_id', fallback=''))
+        self.topics_var = tk.StringVar(value=config.get('AdvancedSearch', 'topics', fallback=''))
+        self.exclude_topics_var = tk.StringVar(value=config.get('AdvancedSearch', 'exclude_topics', fallback=''))
 
+        self.transient(parent)
+        self.grab_set()
         self.create_widgets()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def create_widgets(self):
-        container_frame = ttk.Frame(self, padding=10)
-        container_frame.pack(fill=BOTH, expand=YES)
+        main_frame = ttk.Frame(self, padding="10")
+        main_frame.pack(fill=BOTH, expand=True)
 
-        # Add a Canvas for scrolling
-        canvas = tk.Canvas(container_frame, borderwidth=0, background="#ffffff") # Use tk.Canvas
-        scrollbar = ttk.Scrollbar(container_frame, orient="vertical", command=canvas.yview)
-        self.scrollable_frame = ttk.Frame(canvas) # Use ttk.Frame inside canvas, assign to self
+        # Search Query
+        ttk.Label(main_frame, text="Search Query:").grid(row=0, column=0, sticky='w', pady=2)
+        ttk.Entry(main_frame, textvariable=self.search_query_var, width=80).grid(row=0, column=1, columnspan=3, sticky='we', pady=2)
 
-        self.scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(
-                scrollregion=canvas.bbox("all")
-            )
-        )
+        # Sorting Frame
+        sort_frame = ttk.LabelFrame(main_frame, text="Sorting", padding="10")
+        sort_frame.grid(row=1, column=0, columnspan=4, sticky='we', pady=5)
+        sort_frame.grid_columnconfigure(1, weight=1)
 
-        canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw") # Use self.scrollable_frame
+        ttk.Label(sort_frame, text="Sort by:").grid(row=0, column=0, sticky='w')
+        sort_options = ['download_count', 'last_activity_at', 'user_count', 'rating_count', 'rating_avg', 'created_at', 'token_count', 'msgs_chat', 'msgs_total', 'name', 'full_path']
+        ttk.Combobox(sort_frame, textvariable=self.sort_by_var, values=sort_options, state='readonly').grid(row=0, column=1, sticky='we', padx=5)
+        
+        order_frame = ttk.Frame(sort_frame)
+        order_frame.grid(row=0, column=2, columnspan=2)
+        ttk.Radiobutton(order_frame, text="Asc", variable=self.sort_asc_var, value=True).pack(side=LEFT, padx=5)
+        ttk.Radiobutton(order_frame, text="Desc", variable=self.sort_asc_var, value=False).pack(side=LEFT, padx=5)
+
+        # Filters Frame
+        filters_frame = ttk.LabelFrame(main_frame, text="Filters", padding="10")
+        filters_frame.grid(row=2, column=0, columnspan=4, sticky='we', pady=5)
+        filters_frame.grid_columnconfigure(1, weight=1)
+        filters_frame.grid_columnconfigure(3, weight=1)
+
+        ttk.Checkbutton(filters_frame, text="Include NSFW", variable=self.nsfw_var).grid(row=0, column=0, sticky='w')
+        ttk.Checkbutton(filters_frame, text="Include NSFL", variable=self.nsfl_var).grid(row=0, column=1, sticky='w')
+
+        ttk.Label(filters_frame, text="Min Tokens:").grid(row=1, column=0, sticky='w', pady=2, padx=5)
+        ttk.Entry(filters_frame, textvariable=self.min_tokens_var).grid(row=1, column=1, sticky='we', pady=2, padx=5)
+        ttk.Label(filters_frame, text="Max Tokens:").grid(row=1, column=2, sticky='w', pady=2, padx=5)
+        ttk.Entry(filters_frame, textvariable=self.max_tokens_var).grid(row=1, column=3, sticky='we', pady=2, padx=5)
+
+        ttk.Label(filters_frame, text="Max Days Ago:").grid(row=2, column=0, sticky='w', pady=2, padx=5)
+        ttk.Entry(filters_frame, textvariable=self.max_days_ago_var).grid(row=2, column=1, sticky='we', pady=2, padx=5)
+        ttk.Label(filters_frame, text="Creator ID:").grid(row=2, column=2, sticky='w', pady=2, padx=5)
+        ttk.Entry(filters_frame, textvariable=self.creator_id_var).grid(row=2, column=3, sticky='we', pady=2, padx=5)
+
+        ttk.Label(filters_frame, text="Tags (csv):").grid(row=3, column=0, sticky='w', pady=2, padx=5)
+        ttk.Entry(filters_frame, textvariable=self.topics_var).grid(row=3, column=1, sticky='we', pady=2, padx=5)
+        ttk.Label(filters_frame, text="Exclude Tags (csv):").grid(row=3, column=2, sticky='w', pady=2, padx=5)
+        ttk.Entry(filters_frame, textvariable=self.exclude_topics_var).grid(row=3, column=3, sticky='we', pady=2, padx=5)
+
+        # Presets Frame
+        presets_frame = ttk.LabelFrame(main_frame, text="Presets", padding="10")
+        presets_frame.grid(row=3, column=0, columnspan=4, sticky='we', pady=10)
+        presets_frame.grid_columnconfigure(0, weight=1)
+        presets_frame.grid_columnconfigure(1, weight=1)
+        presets_frame.grid_columnconfigure(2, weight=1)
+
+        ttk.Button(presets_frame, text="Latest", command=self.set_latest_preset, style='Custom.TButton').grid(row=0, column=0, sticky='ew', padx=5)
+        ttk.Button(presets_frame, text="Trending", command=self.set_trending_preset, style='Custom.TButton').grid(row=0, column=1, sticky='ew', padx=5)
+        ttk.Button(presets_frame, text="Recent Hits", command=self.set_recent_hits_preset, style='Custom.TButton').grid(row=0, column=2, sticky='ew', padx=5)
+
+        # Action Buttons
+        action_frame = ttk.Frame(main_frame)
+        action_frame.grid(row=4, column=0, columnspan=4, sticky='e', pady=(5,0))
+        self.search_button = ttk.Button(action_frame, text="Search", command=self.start_advanced_search, style='Custom.TButton')
+        self.search_button.pack(side=LEFT, padx=5)
+        ttk.Button(action_frame, text="Cancel", command=self.on_close).pack(side=LEFT)
+
+    def save_filters_to_config(self):
+        if not config.has_section('AdvancedSearch'):
+            config.add_section('AdvancedSearch')
+        config.set('AdvancedSearch', 'sort_by', self.sort_by_var.get())
+        config.set('AdvancedSearch', 'sort_asc', str(self.sort_asc_var.get()))
+        config.set('AdvancedSearch', 'nsfw', str(self.nsfw_var.get()))
+        config.set('AdvancedSearch', 'nsfl', str(self.nsfl_var.get()))
+        config.set('AdvancedSearch', 'min_tokens', self.min_tokens_var.get())
+        config.set('AdvancedSearch', 'max_tokens', self.max_tokens_var.get())
+        config.set('AdvancedSearch', 'max_days_ago', self.max_days_ago_var.get())
+        config.set('AdvancedSearch', 'creator_id', self.creator_id_var.get())
+        config.set('AdvancedSearch', 'topics', self.topics_var.get())
+        config.set('AdvancedSearch', 'exclude_topics', self.exclude_topics_var.get())
+        save_config()
+
+    def set_latest_preset(self):
+        self.sort_by_var.set('created_at')
+        self.sort_asc_var.set(False)
+        self.max_days_ago_var.set('')
+        self.min_tokens_var.set('')
+        self.max_tokens_var.set('')
+        self.creator_id_var.set('')
+        self.topics_var.set('')
+        self.exclude_topics_var.set('')
+
+    def set_trending_preset(self):
+        self.sort_by_var.set('trending')
+        self.sort_asc_var.set(False)
+        self.max_days_ago_var.set('7')
+        self.min_tokens_var.set('')
+        self.max_tokens_var.set('')
+        self.creator_id_var.set('')
+        self.topics_var.set('')
+        self.exclude_topics_var.set('')
+
+    def set_recent_hits_preset(self):
+        self.sort_by_var.set('trending')
+        self.sort_asc_var.set(False)
+        self.max_days_ago_var.set('1')
+        self.min_tokens_var.set('')
+        self.max_tokens_var.set('')
+        self.creator_id_var.set('')
+        self.topics_var.set('')
+        self.exclude_topics_var.set('')
+
+    def start_advanced_search(self):
+        self.save_filters_to_config()
+        self.search_button.config(state=DISABLED)
+        status_var.set("Executing advanced search...")
+        threading.Thread(target=self.execute_advanced_search, daemon=True).start()
+
+    def execute_advanced_search(self):
+        try:
+            base_url = "https://api.chub.ai/search"
+            params = {
+                'search': self.search_query_var.get(),
+                'sort': self.sort_by_var.get(),
+                'sort_dir': 'asc' if self.sort_asc_var.get() else 'desc',
+                'nsfw': self.nsfw_var.get(),
+                'nsfl': self.nsfl_var.get(),
+                'min_tokens': self.min_tokens_var.get(),
+                'max_tokens': self.max_tokens_var.get(),
+                'max_days_ago': self.max_days_ago_var.get(),
+                'creator': self.creator_id_var.get(),
+                'topics': self.topics_var.get(),
+                'exclude_topics': self.exclude_topics_var.get(),
+                'first': 20, # Corresponds to results_per_page in CardSelectionPopup
+                'page': 1
+            }
+            
+            # Clean up empty parameters
+            search_params = {k: v for k, v in params.items() if v not in [None, '', False]}
+            if self.nsfw_var.get(): search_params['nsfw'] = 'true'
+            if self.nsfl_var.get(): search_params['nsfl'] = 'true'
+
+            response = requests.get(base_url, headers=self.headers, params=search_params)
+            response.raise_for_status()
+            api_response_data = response.json()
+
+            nodes = api_response_data.get('data', {}).get('nodes', [])
+            count = api_response_data.get('data', {}).get('count', 0)
+
+            result_queue = queue.Queue()
+            if count == 0:
+                self.parent.after(0, lambda: messagebox.showinfo("No Results", "No cards found with the specified criteria."))
+                self.parent.after(0, self.on_close)
+                return
+            elif count == 1:
+                result_queue.put(nodes[0])
+            else:
+                self.parent.after(0, lambda: self.show_selection_popup(api_response_data, result_queue))
+            
+            selected_node = result_queue.get() # This will block until a card is selected or popup is closed
+
+            if selected_node:
+                self.parent.after(0, lambda: self.start_download(selected_node))
+            else:
+                # This case happens if the selection popup is closed without a selection
+                self.parent.after(0, self.on_close)
+
+        except requests.exceptions.HTTPError as http_err:
+            try:
+                error_detail = http_err.response.json()
+                self.parent.after(0, lambda: messagebox.showerror("HTTP Error", f"A server error occurred: {http_err.response.status_code}\nDetails: {error_detail}"))
+            except json.JSONDecodeError:
+                self.parent.after(0, lambda: messagebox.showerror("HTTP Error", f"An HTTP error occurred: {http_err}"))
+            self.parent.after(0, self.on_close)
+        except Exception as err:
+            logging.error(f"An error occurred during advanced search: {err}")
+            self.parent.after(0, lambda: messagebox.showerror("Error", f"An unexpected error occurred: {err}"))
+            self.parent.after(0, self.on_close)
+
+    def show_selection_popup(self, api_response, result_queue):
+        # This method now correctly handles the modal nature of the popup
+        # and ensures the main flow waits for a selection.
+        popup = CardSelectionPopup(self.parent, self.search_query_var.get(), api_response, self.headers)
+        # The parent waits for the popup to be destroyed
+        self.parent.wait_window(popup)
+        # After popup is closed, get the result from it
+        result_queue.put(popup.selected_card_node)
+        self.destroy() # Close the advanced search window
+
+    def start_download(self, node):
+        bundle_option = var.get()
+        output_directory = output_dir.get()
+        status_var.set(f"Card selected: {node.get('name', 'Unknown')}. Starting download...")
+        # Disable buttons in the main app window
+        self.parent.set_ui_state(DISABLED)
+        threading.Thread(target=download_card_thread, args=(node, bundle_option, output_directory, self.headers, None, status_var, self.parent.set_ui_state), daemon=True).start()
+        self.destroy()
+
+    def on_close(self):
+        self.grab_release()
+        self.destroy()
+
+    def show(self):
+        # This method is kept for compatibility but the main logic is now in show_selection_popup
+        self.wait_window(self)
+        return self.selected_card_node
+
+class CardSelectionPopup(ttk.Toplevel):
+    def __init__(self, parent, query, initial_response, headers):
+        super().__init__(parent)
+        self.title("Select a Card")
+        self.geometry("700x650")
+        self.parent = parent
+        self.query = query
+        self.headers = headers
+        self.selected_card_node = None
+
+        self.page_cache = {}
+        self.image_cache = {}
+        self.current_page = 1
+        self.results_per_page = 20  # Corresponds to MAX_CARDS_TO_DISPLAY
+        self.total_results = initial_response.get('data', {}).get('count', 0)
+        self.total_pages = (self.total_results + self.results_per_page - 1) // self.results_per_page
+
+        # Cache the first page
+        self.page_cache[1] = initial_response.get('data', {}).get('nodes', [])
+
+        self.transient(parent)
+        self.grab_set()
+
+        self.create_widgets()
+        self.populate_page(self.current_page)
+        self.prefetch_next_page()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def create_widgets(self):
+        # Main container
+        main_frame = ttk.Frame(self, padding=10)
+        main_frame.pack(fill=BOTH, expand=YES)
+
+        # Canvas for scrolling content
+        canvas = tk.Canvas(main_frame, borderwidth=0, background="#ffffff")
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        self.scrollable_frame = ttk.Frame(canvas)
+
+        self.scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
 
         canvas.pack(side=LEFT, fill=BOTH, expand=True)
         scrollbar.pack(side=RIGHT, fill=Y)
-        
-        if not self.cards_data:
+
+        # Pagination controls
+        pagination_frame = ttk.Frame(self, padding=(10, 5))
+        pagination_frame.pack(fill=X, side=BOTTOM)
+
+        self.prev_button = ttk.Button(pagination_frame, text="<< Previous", command=self.prev_page, style='Custom.TButton')
+        self.prev_button.pack(side=LEFT, padx=5)
+
+        self.page_label = ttk.Label(pagination_frame, text=f"Page {self.current_page} / {self.total_pages}")
+        self.page_label.pack(side=LEFT, expand=True)
+
+        self.next_button = ttk.Button(pagination_frame, text="Next >>", command=self.next_page, style='Custom.TButton')
+        self.next_button.pack(side=RIGHT, padx=5)
+
+    def populate_page(self, page_number):
+        # Clear existing widgets
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+
+        cards_data = self.page_cache.get(page_number, [])
+        if not cards_data:
             ttk.Label(self.scrollable_frame, text="No cards to display.").pack(padx=10, pady=10)
             return
 
-        MAX_CARDS_TO_DISPLAY = 20
-        displayed_cards = self.cards_data[:MAX_CARDS_TO_DISPLAY]
+        for card_node in cards_data:
+            self.create_card_widget(card_node)
 
-        for i, card_node in enumerate(displayed_cards):
-            card_item_frame = ttk.Frame(self.scrollable_frame, padding=10, relief=SOLID, borderwidth=1)
-            card_item_frame.pack(pady=10, padx=10, fill=X, expand=YES)
+        self.update_pagination_controls()
+        self.prefetch_next_page()
 
-            # --- Left side: Image ---
-            left_frame = ttk.Frame(card_item_frame)
-            left_frame.pack(side=LEFT, padx=(0,10), fill=Y)
+    def create_card_widget(self, card_node):
+        card_item_frame = ttk.Frame(self.scrollable_frame, padding=10, relief=SOLID, borderwidth=1)
+        card_item_frame.pack(pady=10, padx=10, fill=X, expand=YES)
 
-            avatar_url = card_node.get('avatar_url')
-            img_data = None
-            if avatar_url:
-                try:
-                    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-                    response = requests.get(avatar_url, headers=headers, stream=True, timeout=10)
-                    response.raise_for_status()
-                    img_data = response.content
-                except requests.exceptions.RequestException as e:
-                    print(f"Error fetching avatar {avatar_url}: {e}")
-                    img_data = None
+        left_frame = ttk.Frame(card_item_frame)
+        left_frame.pack(side=LEFT, padx=(0, 10), fill=Y)
 
-            if img_data:
-                try:
-                    image = Image.open(BytesIO(img_data))
-                    image.thumbnail((100, 100)) # Resize to max 100x100
-                    photo = ImageTk.PhotoImage(image)
-                    img_label = ttk.Label(left_frame, image=photo)
-                    img_label.image = photo # Keep a reference!
-                    img_label.pack(pady=5, padx=5)
-                except Exception as e:
-                    print(f"Error processing image for {card_node.get('name')}: {e}")
-                    ttk.Label(left_frame, text="Image N/A").pack(pady=5, padx=5)
+        avatar_url = card_node.get('avatar_url')
+        img_label = ttk.Label(left_frame, text="Loading...")
+        img_label.pack(pady=5, padx=5)
+
+        if avatar_url:
+            if avatar_url in self.image_cache:
+                img_label.config(image=self.image_cache[avatar_url], text="")
             else:
-                ttk.Label(left_frame, text="No Avatar").pack(pady=5, padx=5)
+                threading.Thread(target=self.load_image, args=(avatar_url, img_label), daemon=True).start()
+        else:
+            img_label.config(text="No Avatar")
 
-            # --- Right side: Details and Button ---
-            right_frame = ttk.Frame(card_item_frame)
-            right_frame.pack(side=LEFT, fill=X, expand=YES)
+        right_frame = ttk.Frame(card_item_frame)
+        right_frame.pack(side=LEFT, fill=X, expand=YES)
 
-            name_label = ttk.Label(right_frame, text=f"{card_node.get('name', 'N/A')}", font=('Segoe UI', 12, 'bold'), wraplength=450)
-            name_label.pack(anchor=W, pady=(0,2))
-            
-            path_label = ttk.Label(right_frame, text=f"Path: {card_node.get('fullPath', 'N/A')}", font=('Segoe UI', 9), wraplength=450)
-            path_label.pack(anchor=W)
+        name_label = ttk.Label(right_frame, text=f"{card_node.get('name', 'N/A')}", font=('Segoe UI', 12, 'bold'), wraplength=450)
+        name_label.pack(anchor=W, pady=(0, 2))
 
-            tagline_text = card_node.get('tagline', 'N/A')
-            if not tagline_text or tagline_text.isspace():
-                tagline_text = "No tagline available."
-            tagline_label = ttk.Label(right_frame, text=f"{tagline_text}", font=('Segoe UI', 10), wraplength=450, justify=LEFT)
-            tagline_label.pack(anchor=W, pady=(5,10), fill=X, expand=YES)
+        path_label = ttk.Label(right_frame, text=f"Path: {card_node.get('fullPath', 'N/A')}", font=('Segoe UI', 9), wraplength=450)
+        path_label.pack(anchor=W)
 
-            select_button = ttk.Button(right_frame, text="Select this Card", 
-                                       command=lambda cn=card_node: self.on_select(cn), style='Custom.TButton', state=DISABLED)
-            select_button.pack(anchor=E, pady=5)
-            self.select_buttons.append(select_button)
+        tagline_text = card_node.get('tagline', 'N/A') or "No tagline available."
+        tagline_label = ttk.Label(right_frame, text=tagline_text, font=('Segoe UI', 10), wraplength=450, justify=LEFT)
+        tagline_label.pack(anchor=W, pady=(5, 10), fill=X, expand=YES)
 
-        if len(self.cards_data) > MAX_CARDS_TO_DISPLAY:
-            info_label = ttk.Label(self.scrollable_frame, 
-                                   text=f"Showing {MAX_CARDS_TO_DISPLAY} of {len(self.cards_data)} results. Refine search if needed.", 
-                                   font=('Segoe UI', 9, 'italic'))
-            info_label.pack(pady=(10,5), padx=10, fill=X)
+        select_button = ttk.Button(right_frame, text="Download this Card", command=lambda cn=card_node: self.on_select(cn), style='Custom.TButton')
+        select_button.pack(anchor=E, pady=5)
 
-        # Enable all select buttons now that card items are loaded
-        for btn in self.select_buttons:
-            btn.config(state=NORMAL)
+    def update_pagination_controls(self):
+        self.page_label.config(text=f"Page {self.current_page} / {self.total_pages}")
+        self.prev_button.config(state=NORMAL if self.current_page > 1 else DISABLED)
+        self.next_button.config(state=NORMAL if self.current_page < self.total_pages else DISABLED)
+
+    def go_to_page(self, page_number):
+        if not (1 <= page_number <= self.total_pages):
+            return
+
+        self.current_page = page_number
+        if page_number in self.page_cache:
+            self.populate_page(page_number)
+        else:
+            ttk.Label(self.scrollable_frame, text="Loading page...").pack(pady=20)
+            threading.Thread(target=self.fetch_and_display_page, args=(page_number,), daemon=True).start()
+
+    def fetch_and_display_page(self, page_number):
+        try:
+            search_url = f"https://api.chub.ai/search?search={self.query}&page={page_number}&first={self.results_per_page}&nsfw=true&nsfl=true"
+            response = requests.get(search_url, headers=self.headers, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            nodes = data.get('data', {}).get('nodes', [])
+            self.page_cache[page_number] = nodes
+            self.parent.after(0, self.populate_page, page_number)
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to fetch page {page_number}: {e}")
+            self.parent.after(0, lambda: messagebox.showerror("API Error", f"Failed to fetch page {page_number}."))
+
+    def prefetch_next_page(self):
+        next_page = self.current_page + 1
+        if 1 <= next_page <= self.total_pages and next_page not in self.page_cache:
+            threading.Thread(target=self.fetch_page_data, args=(next_page,), daemon=True).start()
+
+    def fetch_page_data(self, page_number):
+        if page_number in self.page_cache: # Double check before fetching
+            return
+        try:
+            search_url = f"https://api.chub.ai/search?search={self.query}&page={page_number}&first={self.results_per_page}&nsfw=true&nsfl=true"
+            response = requests.get(search_url, headers=self.headers, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            nodes = data.get('data', {}).get('nodes', [])
+            self.page_cache[page_number] = nodes
+
+            # Pre-load images for the fetched page
+            for card_node in nodes:
+                avatar_url = card_node.get('avatar_url')
+                if avatar_url and avatar_url not in self.image_cache:
+                    threading.Thread(target=self.preload_image_data, args=(avatar_url,), daemon=True).start()
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to prefetch page {page_number}: {e}")
+
+    def next_page(self):
+        self.go_to_page(self.current_page + 1)
+
+    def prev_page(self):
+        self.go_to_page(self.current_page - 1)
 
     def on_select(self, card_node):
         self.selected_card_node = card_node
-        if self.scrollable_frame: 
-            # Destroy all children of scrollable_frame first
-            for widget in self.scrollable_frame.winfo_children():
-                widget.destroy()
-            self.scrollable_frame.unbind("<Configure>")
-        self.grab_release()
-        self.after_idle(self.destroy) # Defer destroy
+        self.on_close()
 
     def on_close(self):
-        self.selected_card_node = None # Explicitly set to None
-        if self.scrollable_frame:
-            # Destroy all children of scrollable_frame first
-            for widget in self.scrollable_frame.winfo_children():
-                widget.destroy()
-            self.scrollable_frame.unbind("<Configure>")
+        self.selected_card_node = None # Ensure nothing is returned if closed
         self.grab_release()
-        self.after_idle(self.destroy) # Defer destroy
+        self.destroy()
 
     def show(self):
-        self.parent.wait_window(self) # Wait for this window to close
+        self.wait_window(self)
         return self.selected_card_node
 
-def download_card_thread():
-    """
-    Handles the card download process in a separate thread.
-    Provides feedback and error handling.
-    """
+    def preload_image_data(self, url):
+        if url in self.image_cache:
+            return
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            response = requests.get(url, headers=headers, stream=True, timeout=10)
+            response.raise_for_status()
+            img_data = response.content
+            image = Image.open(BytesIO(img_data))
+            image.thumbnail((100, 100))
+            photo = ImageTk.PhotoImage(image)
+            self.image_cache[url] = photo
+        except Exception as e:
+            logging.error(f"Error pre-loading image from {url}: {e}")
+
+    def load_image(self, url, img_label):
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            response = requests.get(url, headers=headers, stream=True, timeout=10)
+            response.raise_for_status()
+            img_data = response.content
+            image = Image.open(BytesIO(img_data))
+            image.thumbnail((100, 100))
+            photo = ImageTk.PhotoImage(image)
+            self.image_cache[url] = photo
+            self.parent.after(0, lambda: img_label.config(image=photo, text=""))
+        except Exception as e:
+            logging.error(f"Error loading image from {url}: {e}")
+            self.parent.after(0, lambda: img_label.config(text="Image N/A"))
+
+    def on_close(self):
+        self.grab_release()
+        self.destroy()
+
+def on_search_click():
+    set_ui_state(DISABLED)
+    threading.Thread(target=search_and_select_card, daemon=True).start()
+
+def open_advanced_search():
+    api_token = config['Settings'].get('api_token', '').strip()
+    headers = {
+        'accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    if api_token:
+        headers['Authorization'] = f'Bearer {api_token}'
+    
+    adv_popup = AdvancedSearchPopup(app, headers)
+    # No need to call show() here as the popup manages its own lifecycle
+
+def on_download_click():
+    set_ui_state(DISABLED)
+    threading.Thread(target=download_card_direct, daemon=True).start()
+
+def download_card_direct():
     try:
         # Disable buttons during download
+        search_button.config(state=DISABLED)
         download_button.config(state=DISABLED)
         token_button.config(state=DISABLED)
         select_output_button.config(state=DISABLED)
         status_var.set("Downloading card...")
 
-        name = entry.get().strip()
+        input_text = entry.get().strip()
         bundle_option = var.get()
         output_directory = output_dir.get()
         api_token = config['Settings'].get('api_token', '').strip()
 
-        if not name:
-            messagebox.showwarning("Input Error", "Please enter the name of the card.")
+        if not input_text:
+            messagebox.showwarning("Input Error", "Please enter a valid Chub.ai URL or character path.")
             return
 
         if not output_directory:
             messagebox.showwarning("Output Directory Not Set", "Please select an output directory.")
             return
 
-        # Headers for API requests
-        headers = {
-            'accept': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
+        # Prepare headers
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
         if api_token:
             headers['Authorization'] = f'Bearer {api_token}'
 
-        # New API call: Search for the card, include nsfw=true and nsfl=true
-        search_url = f"https://api.chub.ai/search?search={name}&nsfw=true&nsfl=true"
-        print(f"Initial search URL: {search_url}") # Debug print for initial search
-        status_var.set(f"Searching for: {name}...")
+        # Extract character path from input
+        character_path = input_text
+        if 'characters/' in character_path:
+            character_path = character_path.split('characters/')[-1]
 
-        response = requests.get(search_url, headers=headers)
-        response.raise_for_status()
-
-        api_response_data = response.json()
-
-        nodes = api_response_data.get('data', {}).get('nodes', [])
-        count = len(nodes)
-
-        node = None # Initialize node
-        if count == 0:
-            if not api_token: # This check's relevance might change if token isn't used for search
-                messagebox.showinfo(
-                    "No Results",
-                    "No card found with the given name.\n\n"
-                    "If you're searching for NSFL or private cards, you may need to set your Chub.ai token."
-                )
-            else:
-                messagebox.showinfo("No Results", "No card found with the given name.")
-            status_var.set("No results found. Ready.")
-            return # Essential to stop processing if no card is found
-        elif count == 1:
-            node = nodes[0]
-            status_var.set(f"Found card: {node.get('name', 'Unknown')}. Proceeding...")
-        else:  # count > 1
-            status_var.set(f"Multiple cards found ({count}). Awaiting selection...")
-            # 'app' is a global variable in this script's context. 'style' is also global for ttk.
-            popup = CardSelectionPopup(app, nodes) 
-            selected_card_from_popup = popup.show() # This blocks until popup is closed
-
-            if selected_card_from_popup:
-                node = selected_card_from_popup
-                status_var.set(f"Card selected: {node.get('name', 'Unknown')}. Proceeding...")
-            else:
-                status_var.set("Card selection cancelled. Ready.")
-                messagebox.showinfo("Selection Cancelled", "No card was selected for download.")
-                return # Exit if no card selected
-
-        # Check if a card was actually selected/found before proceeding
-        if not node:
-            status_var.set("No card available for download. Ready.")
-            # messagebox.showinfo("Process Halted", "No card was available or selected for download.") # Already handled by selection logic
+        if not character_path:
+            messagebox.showwarning("Input Error", "Please enter a valid Chub.ai URL or character path.\nExample: 'https://chub.ai/characters/dabozo/francis-franny-maywood-f8a5a1e15457' or 'dabozo/francis-franny-maywood-f8a5a1e15457'")
             return
+
+        status_var.set(f"Fetching card: {character_path}...")
+
+        # API call to get card data
+        api_url = f"https://api.chub.ai/api/characters/{character_path}?full=false"
+        response = requests.get(api_url, headers=headers, timeout=15)
+        if response.status_code != 200:
+            logging.error(f"API Error for {api_url}: Status {response.status_code}, Response: {response.text}")
+            messagebox.showerror("API Error", f"Failed to fetch card data (Status: {response.status_code}). Please check the URL/path and logs for details.")
+            return
+        card_data = response.json()
+
+        if not card_data or 'node' not in card_data:
+            messagebox.showerror("API Error", "Failed to fetch card data. Please check the URL/path.")
+            return
+
+        node = card_data.get('node')
+        if not node:
+            messagebox.showerror("API Error", "No card found with the provided path.")
+            return
+
+        # Proceed with download using existing logic
+        status_var.set(f"Card found: {node.get('name', 'Unknown')}. Proceeding...")
 
         # Determine AI Rating
         status_var.set(f"Preparing to determine AI rating for {node.get('name', 'Unknown')}...")
         ai_rating, calls_made = determine_ai_rating(node, headers, status_var)
+
+        # Proceed with the rest of the download process
+        download_card_thread(node, bundle_option, output_directory, headers, ai_rating, status_var)
+
+    except requests.exceptions.RequestException as e:
+        status_var.set(f"API Error: {e}")
+        messagebox.showerror("API Error", f"Failed to connect to Chub.ai API: {e}")
+    except Exception as e:
+        status_var.set(f"Error: {e}")
+        messagebox.showerror("Error", f"An unexpected error occurred: {e}")
+    finally:
+        # Always re-enable UI
+        app.after(0, set_ui_state, NORMAL)
+        download_button.config(state=NORMAL)
+        token_button.config(state=NORMAL)
+        select_output_button.config(state=NORMAL)
+
+def download_card_thread(node, bundle_option, output_directory, headers, ai_rating, status_var, ui_callback=None):
+    try:
+        # Check if a card was actually selected/found before proceeding
+        if not node:
+            status_var.set("No card available for download. Ready.")
+            return
+
         node['ai_rating_determined'] = ai_rating # Store it in the node data for HTML generation
-        # messagebox.showinfo("AI Rating Check", f"Determined AI Rating for '{node.get('name', 'Unknown')}': {ai_rating}\n(Took {calls_made} API calls)")
 
         card_id = node['id']
-        full_path = node['fullPath']
-        description = node['description']
+        full_path = node.get('fullPath') or node.get('path')
         name = node['name']
 
         # Sanitize the name for use in file paths
@@ -477,18 +811,12 @@ def download_card_thread():
         max_res_url = node.get('max_res_url')
         if not max_res_url:
             messagebox.showerror("Download Error", "Could not find 'max_res_url' for the selected card to download the image.")
-            # Optionally, decide if you want to proceed without the main image or return
-            # For now, let's log and potentially allow proceeding for gallery/HTML
             logging.error(f"max_res_url not found for card {full_path}")
-            # If the main image is critical, you might want to 'return' here.
         else:
             status_var.set(f"Downloading card image from {max_res_url[:50]}...")
             try:
-                # Use the same headers as search, or a simplified one if token not needed for direct image download
                 image_response = requests.get(max_res_url, headers=headers, stream=True, timeout=30)
                 image_response.raise_for_status()
-                
-                # Save the PNG file
                 with open(os.path.join(card_dir, f"{sanitized_name}.png"), 'wb') as img_file:
                     for chunk in image_response.iter_content(chunk_size=8192):
                         img_file.write(chunk)
@@ -496,30 +824,30 @@ def download_card_thread():
             except requests.exceptions.RequestException as img_err:
                 messagebox.showerror("Image Download Error", f"Failed to download card image from {max_res_url}: {img_err}")
                 logging.error(f"Failed to download card image from {max_res_url}: {img_err}")
-                # Decide if you want to proceed or return here as well
 
         # Third API call to get gallery images
         gallery_url = f"https://api.chub.ai/api/gallery/project/{card_id}?nsfw=true&page=1&limit=24"
+        try:
+            response = requests.get(gallery_url, headers=headers)
+            response.raise_for_status()
+            gallery_data = response.json()
+            gallery_count = gallery_data.get('count', 0)
 
-        response = requests.get(gallery_url, headers=headers)
-        response.raise_for_status()
-
-        gallery_data = response.json()
-        gallery_count = gallery_data.get('count', 0)
-
-        if gallery_count >= 1:
-            for image_node in gallery_data['nodes']:
-                image_url = image_node['primary_image_path']
-                image_response = requests.get(image_url)
-                if image_response.status_code == 200:
-                    image_name = image_url.split('/')[-1]
-                    sanitized_image_name = sanitize_filename(image_name)
-                    with open(os.path.join(card_dir, sanitized_image_name), 'wb') as img_file:
-                        img_file.write(image_response.content)
-                else:
-                    logging.error(f"Failed to download gallery image: {image_url}")
-        else:
-            messagebox.showinfo("Gallery Info", "No gallery images found.")
+            if gallery_count >= 1:
+                for image_node in gallery_data['nodes']:
+                    image_url = image_node['primary_image_path']
+                    image_response = requests.get(image_url)
+                    if image_response.status_code == 200:
+                        image_name = image_url.split('/')[-1]
+                        sanitized_image_name = sanitize_filename(image_name)
+                        with open(os.path.join(card_dir, sanitized_image_name), 'wb') as img_file:
+                            img_file.write(image_response.content)
+                    else:
+                        logging.error(f"Failed to download gallery image: {image_url}")
+            else:
+                logging.info("No gallery images found for this card.")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to fetch gallery images: {e}")
 
         # Bundle option
         if bundle_option == 'Zip':
@@ -528,31 +856,93 @@ def download_card_thread():
                 for file in files:
                     zipf.write(os.path.join(root, file), arcname=file)
             zipf.close()
-            # Remove the folder if zipped
-            for root, dirs, files in os.walk(card_dir, topdown=False):
-                for file in files:
-                    os.remove(os.path.join(root, file))
-                os.rmdir(root)
+            shutil.rmtree(card_dir)
             messagebox.showinfo("Success", f"All files have been saved and zipped at {card_dir}.zip")
             status_var.set("Download complete. Ready.")
         else:
             messagebox.showinfo("Success", f"All files have been saved in {card_dir}")
             status_var.set("Download complete. Ready.")
 
-    except requests.exceptions.HTTPError as http_err:
-        logging.error(f"HTTP error occurred: {http_err}")
-        messagebox.showerror("HTTP Error", f"An HTTP error occurred: {http_err}")
-        status_var.set("HTTP Error. Ready for new attempt.")
+    except Exception as err:
+        logging.error(f"An error occurred during download: {err}")
+        messagebox.showerror("Error", f"An error occurred during download: {err}")
+        status_var.set("Error occurred. Ready for new attempt.")
+
+def search_and_select_card():
+    app.after(0, set_ui_state, DISABLED)
+    try:
+        status_var.set("Searching for card...")
+
+        name = entry.get().strip()
+        bundle_option = var.get()
+        output_directory = output_dir.get()
+        api_token = config['Settings'].get('api_token', '').strip()
+
+        if not name:
+            messagebox.showwarning("Input Error", "Please enter the name of the card.")
+            return
+
+        if not output_directory:
+            messagebox.showwarning("Output Directory Not Set", "Please select an output directory.")
+            return
+
+        # Headers for API requests
+        headers = {
+            'accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        if api_token:
+            headers['Authorization'] = f'Bearer {api_token}'
+
+        search_url = f"https://api.chub.ai/search?search={name}&page=1&first=20&nsfw=true&nsfl=true&count=true"
+        status_var.set(f"Searching for: {name}...")
+
+        response = requests.get(search_url, headers=headers, timeout=15)
+        response.raise_for_status()
+        initial_response = response.json()
+
+        if not initial_response or 'data' not in initial_response:
+            status_var.set("API Error: Invalid response from server.")
+            messagebox.showerror("API Error", "Received an invalid or empty response from the server.")
+            return
+
+        nodes = initial_response.get('data', {}).get('nodes', [])
+        count = initial_response.get('data', {}).get('count', 0)
+
+        node = None # Initialize node
+        if count == 0:
+            messagebox.showinfo("No Results", "No card found with the given name.")
+            status_var.set("No results found. Ready.")
+            return
+        elif count == 1:
+            node = nodes[0]
+            status_var.set(f"Found card: {node.get('name', 'Unknown')}. Proceeding...")
+        else:
+            status_var.set(f"Multiple cards found ({count}). Awaiting selection...")
+            popup = CardSelectionPopup(app, name, initial_response, headers)
+            selected_card_node = popup.show()
+            if selected_card_node:
+                node = selected_card_node
+                status_var.set(f"Card selected: {node.get('name', 'Unknown')}. Proceeding...")
+            else:
+                status_var.set("Card selection cancelled. Ready.")
+                return
+
+        if node:
+            status_var.set(f"Preparing to determine AI rating for {node.get('name', 'Unknown')}...")
+            ai_rating, calls_made = determine_ai_rating(node, headers, status_var)
+            download_card_thread(node, bundle_option, output_directory, headers, ai_rating, status_var)
+
+    except requests.exceptions.RequestException as e:
+        status_var.set(f"API Error: {e}")
+        messagebox.showerror("API Error", f"An error occurred while communicating with the API: {e}")
     except Exception as err:
         logging.error(f"An error occurred: {err}")
         messagebox.showerror("Error", f"An error occurred: {err}")
         status_var.set("Error occurred. Ready for new attempt.")
     finally:
-        # Re-enable buttons after download or cancellation/error
-        download_button.config(state=NORMAL)
-        token_button.config(state=NORMAL)
-        select_output_button.config(state=NORMAL)
-        # Status is set by specific paths (success, error, cancellation), so no general set here.
+        # Always re-enable UI
+        app.after(0, set_ui_state, NORMAL)
 
 def download_card():
     """
@@ -850,12 +1240,39 @@ select_output_button.grid(row=2, column=2, sticky=W, padx=(5, 0), pady=(5, 5))
 token_button = ttk.Button(frame, text="Set Chub.ai Token", command=set_api_token, style='Custom.TButton')
 token_button.grid(row=3, column=0, columnspan=3, sticky=EW, pady=(10, 0))
 
-# Download Button
-download_button = ttk.Button(frame, text="Download Card", command=download_card, style='Custom.TButton')
-download_button.grid(row=4, column=0, columnspan=3, sticky=EW, pady=(10, 0))
+# Search and Download Buttons Frame
+buttons_frame = ttk.Frame(frame)
+buttons_frame.grid(row=4, column=0, columnspan=3, sticky=EW, pady=(10, 0))
+buttons_frame.grid_columnconfigure(0, weight=1)
+
+# Download by URL/Path Button
+download_url_button = ttk.Button(buttons_frame, text="Download by URL/Path", command=on_download_click, style='Custom.TButton')
+download_url_button.grid(row=0, column=0, sticky=EW, padx=(0, 5))
+
+# Search and Advanced Buttons
+search_buttons_subframe = ttk.Frame(buttons_frame)
+search_buttons_subframe.grid(row=0, column=1, sticky=EW)
+search_buttons_subframe.grid_columnconfigure(0, weight=1)
+search_buttons_subframe.grid_columnconfigure(1, weight=1)
+
+search_button = ttk.Button(search_buttons_subframe, text="Search", command=on_search_click, style='Custom.TButton')
+search_button.grid(row=0, column=0, sticky=EW, padx=(0, 2))
+
+advanced_search_button = ttk.Button(search_buttons_subframe, text="Advanced", command=open_advanced_search, style='Custom.TButton')
+advanced_search_button.grid(row=0, column=1, sticky=EW, padx=(2, 0))
+
+# Dynamically adjust the column weights
+app.after(100, lambda: buttons_frame.grid_columnconfigure(1, weight=download_url_button.winfo_width()))
 
 # Status Bar
-status_var = ttk.StringVar(value="Ready")
+status_var = tk.StringVar()
+status_var.set('Ready')
+
+def set_ui_state(state):
+    # state should be NORMAL or DISABLED
+    search_button.config(state=state)
+    advanced_search_button.config(state=state)
+    download_url_button.config(state=state)
 status_bar = ttk.Label(app, textvariable=status_var, relief=SUNKEN, anchor=W, font=('Segoe UI', 10))
 status_bar.pack(side=BOTTOM, fill=X)
 
