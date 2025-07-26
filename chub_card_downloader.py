@@ -4,18 +4,19 @@ import os
 import configparser
 from io import BytesIO
 import zipfile
+import shutil
+import threading
+import queue
+import logging
+from PIL import Image, ImageTk, PngImagePlugin
 import markdown  # For markdown conversion
 
 # Import ttkbootstrap and tkinter modules
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from tkinter import messagebox, filedialog
-import threading
-import logging
 import re  # Import regular expressions module
 import tkinter as tk # For Canvas widget
-from PIL import Image, ImageTk
-import queue
 
 # Determine application path for PyInstaller compatibility
 import sys
@@ -30,9 +31,30 @@ else:
     application_path = os.getcwd()
 
 # Configure logging
+log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+# File handler for downloader.log (INFO and above)
+info_handler = logging.FileHandler("downloader.log")
+info_handler.setLevel(logging.INFO)
+info_handler.setFormatter(log_formatter)
+
+# File handler for error.log (ERROR and above)
 error_log_file = os.path.join(application_path, 'error.log')
-logging.basicConfig(filename=error_log_file, level=logging.ERROR, 
-                    format='%(asctime)s:%(levelname)s:%(message)s')
+error_handler = logging.FileHandler(error_log_file)
+error_handler.setLevel(logging.ERROR)
+error_handler.setFormatter(log_formatter)
+
+# Stream handler for console output (INFO and above)
+stream_handler = logging.StreamHandler()
+stream_handler.setLevel(logging.INFO)
+stream_handler.setFormatter(log_formatter)
+
+# Get the root logger and add handlers
+logger = logging.getLogger()
+logger.setLevel(logging.INFO) # Set the lowest level for the logger itself
+logger.addHandler(info_handler)
+logger.addHandler(error_handler)
+logger.addHandler(stream_handler)
 
 # Define the highlight color
 highlight_color = '#859412'
@@ -57,7 +79,7 @@ style.map('Custom.TButton',
 style.configure('Custom.TButton', borderwidth=0)
 style.configure('TCombobox', fieldbackground='white')
 
-# Load configuration
+# Initialize config parser
 config = configparser.ConfigParser()
 config_file = os.path.join(application_path, 'config.ini')
 
@@ -450,8 +472,8 @@ class AdvancedSearchPopup(tk.Toplevel):
         output_directory = output_dir.get()
         status_var.set(f"Card selected: {node.get('name', 'Unknown')}. Starting download...")
         # Disable buttons in the main app window
-        self.parent.set_ui_state(DISABLED)
-        threading.Thread(target=download_card_thread, args=(node, bundle_option, output_directory, self.headers, None, status_var, self.parent.set_ui_state), daemon=True).start()
+        set_ui_state(DISABLED)
+        threading.Thread(target=download_card_thread, args=(node, bundle_option, output_directory, self.headers, None, status_var, set_ui_state), daemon=True).start()
         self.destroy()
 
     def on_close(self):
@@ -701,8 +723,7 @@ def on_download_click():
 def download_card_direct():
     try:
         # Disable buttons during download
-        search_button.config(state=DISABLED)
-        download_button.config(state=DISABLED)
+        set_ui_state(DISABLED)
         token_button.config(state=DISABLED)
         select_output_button.config(state=DISABLED)
         status_var.set("Downloading card...")
@@ -772,8 +793,7 @@ def download_card_direct():
         messagebox.showerror("Error", f"An unexpected error occurred: {e}")
     finally:
         # Always re-enable UI
-        app.after(0, set_ui_state, NORMAL)
-        download_button.config(state=NORMAL)
+        set_ui_state(NORMAL)
         token_button.config(state=NORMAL)
         select_output_button.config(state=NORMAL)
 
@@ -826,24 +846,41 @@ def download_card_thread(node, bundle_option, output_directory, headers, ai_rati
                 logging.error(f"Failed to download card image from {max_res_url}: {img_err}")
 
         # Third API call to get gallery images
+        logging.info(f"Attempting to fetch gallery for card_id: {card_id}")
         gallery_url = f"https://api.chub.ai/api/gallery/project/{card_id}?nsfw=true&page=1&limit=24"
+        logging.info(f"Fetching gallery from: {gallery_url}")
         try:
-            response = requests.get(gallery_url, headers=headers)
+            response = requests.get(gallery_url, headers=headers, timeout=15)
+            logging.info(f"Gallery API response status: {response.status_code}")
             response.raise_for_status()
             gallery_data = response.json()
-            gallery_count = gallery_data.get('count', 0)
+            logging.info(f"Gallery data received: {json.dumps(gallery_data, indent=2)}")
+            
+            nodes = gallery_data.get('nodes', [])
+            gallery_count = len(nodes) # Use the actual length of the nodes list, not the 'count' field
 
-            if gallery_count >= 1:
-                for image_node in gallery_data['nodes']:
-                    image_url = image_node['primary_image_path']
-                    image_response = requests.get(image_url)
-                    if image_response.status_code == 200:
-                        image_name = image_url.split('/')[-1]
+            if gallery_count > 0:
+                status_var.set(f"Downloading {gallery_count} gallery images...")
+                for i, image_node in enumerate(nodes):
+                    # The correct key for the gallery image URL is 'primary_image_path'
+                    image_url = image_node.get('primary_image_path')
+                    if not image_url:
+                        logging.warning(f"No 'primary_image_path' key found for gallery image node {i}: {image_node}")
+                        continue
+
+                    logging.info(f"Attempting to download gallery image from URL: {image_url}")
+                    status_var.set(f"Downloading gallery image {i+1}/{len(nodes)}...")
+                    try:
+                        image_response = requests.get(image_url, timeout=30)
+                        image_response.raise_for_status()
+                        image_name = image_url.split('/')[-1].split('?')[0] # Clean query params
                         sanitized_image_name = sanitize_filename(image_name)
-                        with open(os.path.join(card_dir, sanitized_image_name), 'wb') as img_file:
+                        file_path = os.path.join(card_dir, sanitized_image_name)
+                        with open(file_path, 'wb') as img_file:
                             img_file.write(image_response.content)
-                    else:
-                        logging.error(f"Failed to download gallery image: {image_url}")
+                        logging.info(f"Successfully downloaded and saved gallery image to {file_path}")
+                    except requests.exceptions.RequestException as img_err:
+                        logging.error(f"Failed to download gallery image {image_url}: {img_err}")
             else:
                 logging.info("No gallery images found for this card.")
         except requests.exceptions.RequestException as e:
@@ -867,6 +904,10 @@ def download_card_thread(node, bundle_option, output_directory, headers, ai_rati
         logging.error(f"An error occurred during download: {err}")
         messagebox.showerror("Error", f"An error occurred during download: {err}")
         status_var.set("Error occurred. Ready for new attempt.")
+    finally:
+        if ui_callback:
+            # Use app.after to ensure UI updates are done in the main thread
+            app.after(0, ui_callback, NORMAL)
 
 def search_and_select_card():
     app.after(0, set_ui_state, DISABLED)
