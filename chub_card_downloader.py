@@ -762,7 +762,7 @@ def download_card_direct():
         response = requests.get(api_url, headers=headers, timeout=15)
         if response.status_code != 200:
             logging.error(f"API Error for {api_url}: Status {response.status_code}, Response: {response.text}")
-            messagebox.showerror("API Error", f"Failed to fetch card data (Status: {response.status_code}). Please check the URL/path and logs for details.")
+            messagebox.showerror("API Error", f"Failed to fetch card data (Status: {response.status_code}). Please check the URL/path and logs for details.\n\nValid URL format: https://chub.ai/characters/Sambolic/valerie-you-ex-out-of-prison-6f6f8b916b36")
             return
         card_data = response.json()
 
@@ -1316,6 +1316,10 @@ def set_ui_state(state):
     download_url_button.config(state=state)
 status_bar = ttk.Label(app, textvariable=status_var, relief=SUNKEN, anchor=W, font=('Segoe UI', 10))
 status_bar.pack(side=BOTTOM, fill=X)
+
+# Version label in lower right corner
+version_label = ttk.Label(app, text="v1.7.2", font=('Segoe UI', 8))
+version_label.place(relx=1.0, rely=1.0, x=-5, y=-5, anchor='se')
 
 # Run the application
 app.mainloop()
