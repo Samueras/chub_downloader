@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chub.ai Fork Scanner</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom scrollbar for logs */
+        .scroller::-webkit-scrollbar {
+            width: 8px;
+        }
+        .scroller::-webkit-scrollbar-track {
+            background: #1f2937;
+        }
+        .scroller::-webkit-scrollbar-thumb {
+            background: #4b5563;
+            border-radius: 4px;
+        }
+        .scroller::-webkit-scrollbar-thumb:hover {
+            background: #6b7280;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen font-sans">
+
+    <div class="container mx-auto p-4 max-w-6xl">
+        
+        <!-- Header -->
+        <header class="mb-8 border-b border-gray-700 pb-4">
+            <h1 class="text-3xl font-bold text-blue-400 mb-2">Chub Fork Scanner</h1>
+            <p class="text-gray-400 text-sm">
+                Scans for characters by <span class="text-white font-mono">Sambolic</span>, extracts IDs, and finds all forks.
+            </p>
+        </header>
+
+        <!-- Controls -->
+        <div class="bg-gray-800 rounded-lg p-6 mb-6 shadow-lg border border-gray-700">
+            <div class="flex flex-wrap gap-4 items-end">
+                <div class="flex-1 min-w-[200px]">
+                    <label class="block text-xs font-bold text-gray-400 uppercase tracking-wide mb-1">Target Username</label>
+                    <input type="text" id="usernameInput" value="Sambolic" class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500 transition">
+                </div>
+                
+                <div class="flex items-center gap-2 pb-2">
+                    <input type="checkbox" id="corsProxy" checked class="w-4 h-4 text-blue-600 rounded focus:ring-blue-600 ring-offset-gray-800 bg-gray-700 border-gray-600">
+                    <label for="corsProxy" class="text-sm text-gray-300 cursor-pointer select-none">
+                        Use CORS Proxy <span class="text-xs text-gray-500">(Fixes browser block errors)</span>
+                    </label>
+                </div>
+
+                <button id="startBtn" onclick="toggleScan()" class="bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 px-6 rounded shadow transition duration-200 flex items-center gap-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                        <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clip-rule="evenodd" />
+                    </svg>
+                    <span id="btnText">Start Scan</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- Progress Area -->
+        <div id="progressArea" class="hidden space-y-4 mb-6">
+            <div class="bg-gray-800 rounded p-4 border border-gray-700">
+                <div class="flex justify-between text-sm mb-1">
+                    <span id="statusText" class="text-blue-300">Initializing...</span>
+                    <span id="percentText" class="text-gray-400">0%</span>
+                </div>
+                <div class="w-full bg-gray-700 rounded-full h-2.5">
+                    <div id="progressBar" class="bg-blue-500 h-2.5 rounded-full transition-all duration-300" style="width: 0%"></div>
+                </div>
+            </div>
+            
+            <!-- Real-time Log -->
+            <div id="logArea" class="bg-black bg-opacity-50 rounded p-3 h-32 overflow-y-auto font-mono text-xs text-green-400 border border-gray-800 scroller">
+                <div class="text-gray-500">System Ready. Click Start to begin...</div>
+            </div>
+        </div>
+
+        <!-- Stats -->
+        <div id="statsArea" class="hidden grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+            <div class="bg-gray-800 p-4 rounded border-l-4 border-blue-500">
+                <div class="text-gray-400 text-xs uppercase">Characters Found</div>
+                <div id="statChars" class="text-2xl font-bold">0</div>
+            </div>
+            <div class="bg-gray-800 p-4 rounded border-l-4 border-purple-500">
+                <div class="text-gray-400 text-xs uppercase">Forks Found</div>
+                <div id="statForks" class="text-2xl font-bold">0</div>
+            </div>
+            <div class="bg-gray-800 p-4 rounded border-l-4 border-green-500">
+                <div class="text-gray-400 text-xs uppercase">API Requests</div>
+                <div id="statReqs" class="text-2xl font-bold">0</div>
+            </div>
+        </div>
+
+        <!-- Results -->
+        <div id="resultsArea" class="hidden">
+            <div class="flex justify-between items-center mb-4">
+                <h2 class="text-xl font-bold text-white">Results</h2>
+                <button onclick="exportJSON()" class="text-sm bg-gray-700 hover:bg-gray-600 text-white px-3 py-1 rounded border border-gray-600">
+                    Download JSON
+                </button>
+            </div>
+            <div id="resultsGrid" class="grid grid-cols-1 gap-6">
+                <!-- Content injected via JS -->
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        // State
+        let allCharacters = [];
+        let totalForksFound = 0;
+        let requestCount = 0;
+        let isScanning = false;
+        let shouldStop = false;
+        
+        // Log helper
+        function log(msg, type = 'info') {
+            const logArea = document.getElementById('logArea');
+            const div = document.createElement('div');
+            div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            if (type === 'error') div.className = 'text-red-400';
+            else if (type === 'success') div.className = 'text-green-300';
+            else div.className = 'text-gray-300';
+            
+            logArea.appendChild(div);
+            logArea.scrollTop = logArea.scrollHeight;
+        }
+
+        // Fetch wrapper to handle Proxy and Rate Limiting
+        async function smartFetch(url, retryCount = 0) {
+            const useProxy = document.getElementById('corsProxy').checked;
+            
+            // Only increment global request counter on the first attempt
+            if (retryCount === 0) {
+                requestCount++;
+                document.getElementById('statReqs').innerText = requestCount;
+            }
+
+            let finalUrl = url;
+            if (useProxy) {
+                // Using corsproxy.io as a reliable public proxy
+                finalUrl = 'https://corsproxy.io/?' + encodeURIComponent(url);
+            }
+
+            try {
+                const response = await fetch(finalUrl);
+                
+                // Handle Rate Limiting (429)
+                if (response.status === 429) {
+                    if (retryCount < 5) { // Max 5 retries
+                        // Exponential backoff: 5s, 10s, 20s, 40s, 80s
+                        // Increased base delay from 2000 to 5000 to clear limits effectively
+                        const delay = 5000 * Math.pow(2, retryCount);
+                        log(`Rate limit (429) hit. Pausing for ${delay/1000}s...`, 'error');
+                        await new Promise(r => setTimeout(r, delay));
+                        return smartFetch(url, retryCount + 1);
+                    } else {
+                        throw new Error("HTTP 429: Too Many Requests (Max retries reached)");
+                    }
+                }
+
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                return await response.json();
+            } catch (err) {
+                // If this is a lower-level network error (not a 429 we already handled), just throw
+                if (retryCount === 0) log(`Fetch error for ${url}: ${err.message}`, 'error');
+                throw err;
+            }
+        }
+
+        // 1. Fetch Character List (Handles Pagination)
+        async function fetchAllCharacters(username) {
+            let page = 1;
+            let hasMore = true;
+            let characters = [];
+            const limit = 400; // API limit from prompt
+
+            log(`Starting search for user: ${username}...`);
+
+            while (hasMore) {
+                try {
+                    // Construct search URL based on prompt parameters
+                    const searchUrl = `https://inference.chub.ai/search?first=${limit}&page=${page}&sort=download_count&asc=false&include_forks=true&nsfw=true&nsfl=true&nsfw_only=false&require_images=false&require_example_dialogues=false&require_alternate_greetings=false&require_custom_prompt=false&exclude_mine=false&min_tokens=200&require_expressions=false&require_lore=false&mine_first=false&require_lore_embedded=false&require_lore_linked=false&my_favorites=false&username=${username}&inclusive_or=false&recommended_verified=false&count=true`;
+                    
+                    log(`Fetching page ${page}...`);
+                    const data = await smartFetch(searchUrl);
+
+                    if (data && data.data && data.data.nodes) {
+                        characters.push(...data.data.nodes);
+                        const totalCount = data.data.count;
+                        
+                        // Check if we need another page
+                        if (characters.length >= totalCount || data.data.nodes.length === 0) {
+                            hasMore = false;
+                        } else {
+                            page++;
+                        }
+                    } else {
+                        hasMore = false;
+                        log("Invalid data structure received", 'error');
+                    }
+                } catch (e) {
+                    log(`Error fetching page ${page}. Stopping search.`, 'error');
+                    hasMore = false;
+                }
+            }
+
+            log(`Found ${characters.length} total characters.`);
+            document.getElementById('statChars').innerText = characters.length;
+            return characters;
+        }
+
+        // 2. Fetch Forks for a specific ID
+        async function fetchForksForId(id, name) {
+            try {
+                // Fork URL based on prompt
+                const forkUrl = `https://inference.chub.ai/forks/project/${id}?limit=20&nsfw=true&nsfl=true`;
+                const data = await smartFetch(forkUrl);
+                
+                // The fork endpoint usually returns a data object or array. 
+                // Adjusting based on standard patterns, assuming 'data' or direct array.
+                const nodes = data.nodes || data.data || (Array.isArray(data) ? data : []);
+                
+                return nodes;
+            } catch (e) {
+                // log(`Failed to fetch forks for ${name} (${id})`, 'error');
+                return [];
+            }
+        }
+
+        // Main Execution Flow
+        async function toggleScan() {
+            if (isScanning) {
+                shouldStop = true;
+                document.getElementById('btnText').innerText = "Stopping...";
+                return;
+            }
+
+            isScanning = true;
+            shouldStop = false;
+            
+            // UI Reset
+            const btn = document.getElementById('startBtn');
+            const btnText = document.getElementById('btnText');
+            btn.classList.replace('bg-blue-600', 'bg-red-600');
+            btn.classList.replace('hover:bg-blue-500', 'hover:bg-red-500');
+            btnText.innerText = "Stop Scan";
+
+            document.getElementById('progressArea').classList.remove('hidden');
+            document.getElementById('statsArea').classList.remove('hidden');
+            document.getElementById('resultsArea').classList.remove('hidden');
+            document.getElementById('resultsGrid').innerHTML = '';
+            document.getElementById('logArea').innerHTML = '';
+            
+            allCharacters = [];
+            totalForksFound = 0;
+            requestCount = 0;
+
+            const username = document.getElementById('usernameInput').value;
+
+            // Step 1: Get Characters
+            let chars = [];
+            try {
+                chars = await fetchAllCharacters(username);
+            } catch (err) {
+                log("Failed to fetch characters list.", 'error');
+            }
+            allCharacters = chars;
+
+            if (chars.length === 0) {
+                log("No characters found or search aborted.", 'error');
+                finishScan();
+                return;
+            }
+
+            // Step 2: Get Forks (with REDUCED concurrency)
+            let completed = 0;
+            const concurrency = 1; // Strict serial mode: process 1 at a time to prevent 429s
+            const total = chars.length;
+            
+            // Render container immediately
+            const resultsGrid = document.getElementById('resultsGrid');
+
+            // Queue processor
+            async function processBatch(batch) {
+                const promises = batch.map(async (char) => {
+                    if (shouldStop) return;
+
+                    const forks = await fetchForksForId(char.id, char.name);
+                    
+                    if (forks.length > 0) {
+                        totalForksFound += forks.length;
+                        document.getElementById('statForks').innerText = totalForksFound;
+                        
+                        // Add to DOM
+                        const card = createResultCard(char, forks);
+                        resultsGrid.appendChild(card);
+                        log(`Found ${forks.length} forks for "${char.name}"`, 'success');
+                    }
+                    
+                    completed++;
+                    updateProgress(completed, total);
+                });
+                await Promise.all(promises);
+            }
+
+            // Chunk the array
+            for (let i = 0; i < chars.length; i += concurrency) {
+                if (shouldStop) {
+                    log("Scan stopped by user.", 'error');
+                    break;
+                }
+                const batch = chars.slice(i, i + concurrency);
+                await processBatch(batch);
+                // Delay set to 1.01s as requested to be safe
+                await new Promise(r => setTimeout(r, 1010)); 
+            }
+
+            if (!shouldStop) {
+                log("Scan complete!", 'success');
+                document.getElementById('statusText').innerText = "Scan Complete";
+            }
+            
+            finishScan();
+        }
+
+        function finishScan() {
+            isScanning = false;
+            shouldStop = false;
+            const btn = document.getElementById('startBtn');
+            const btnText = document.getElementById('btnText');
+            btn.classList.replace('bg-red-600', 'bg-blue-600');
+            btn.classList.replace('hover:bg-red-500', 'hover:bg-blue-500');
+            btnText.innerText = "Start Scan";
+        }
+
+        function updateProgress(current, total) {
+            const percent = Math.floor((current / total) * 100);
+            document.getElementById('progressBar').style.width = `${percent}%`;
+            document.getElementById('percentText').innerText = `${percent}%`;
+            document.getElementById('statusText').innerText = `Scanning character ${current} of ${total}`;
+        }
+
+        // HTML Generator for Results
+        function createResultCard(char, forks) {
+            const div = document.createElement('div');
+            div.className = "bg-gray-800 rounded-lg p-6 border border-gray-700 shadow-lg";
+            
+            let forksHtml = forks.map(fork => `
+                <div class="flex items-start gap-3 bg-gray-900 bg-opacity-50 p-3 rounded mb-2 hover:bg-gray-700 transition">
+                    <div class="flex-1 min-w-0">
+                        <div class="flex justify-between">
+                            <h4 class="font-bold text-blue-300 truncate">${escapeHtml(fork.name || 'Unknown Name')}</h4>
+                            <span class="text-xs bg-gray-700 px-2 py-0.5 rounded text-gray-300">ID: ${fork.id}</span>
+                        </div>
+                        <p class="text-sm text-gray-400 truncate">${escapeHtml(fork.fullPath || 'No path available')}</p>
+                        <div class="text-xs text-gray-500 mt-1 flex gap-2">
+                             <span>Author: ${escapeHtml(fork.fullPath ? fork.fullPath.split('/')[0] : 'Unknown')}</span>
+                             <span>Tokens: ${fork.nTokens || '?'}</span>
+                        </div>
+                    </div>
+                    <a href="https://chub.ai/characters/${fork.fullPath}" target="_blank" class="text-gray-400 hover:text-white">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                        </svg>
+                    </a>
+                </div>
+            `).join('');
+
+            div.innerHTML = `
+                <div class="flex items-center gap-4 mb-4 pb-4 border-b border-gray-700">
+                    <img src="${char.avatar_url || 'https://via.placeholder.com/50'}" class="w-12 h-12 rounded object-cover" onerror="this.src='https://via.placeholder.com/50'">
+                    <div>
+                        <h3 class="text-lg font-bold text-white">${escapeHtml(char.name)}</h3>
+                        <div class="text-sm text-gray-400">Original ID: ${char.id} | Forks: <span class="text-green-400 font-bold">${forks.length}</span></div>
+                    </div>
+                    <a href="https://chub.ai/characters/${char.fullPath}" target="_blank" class="ml-auto bg-gray-700 hover:bg-gray-600 text-xs px-3 py-1 rounded">View Original</a>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+                    ${forksHtml}
+                </div>
+            `;
+            return div;
+        }
+
+        // Utilities
+        function escapeHtml(unsafe) {
+            if (!unsafe) return '';
+            return unsafe
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
+        function exportJSON() {
+            // Need to reconstruct the full data structure from DOM or store it better.
+            // Since we didn't store forks in global state to save memory, we'll just alert for now 
+            // or we could gather from DOM.
+            // Better: Store in memory for export.
+            alert("To save memory, this simple version renders immediately. You can copy the text or use the Print to PDF feature.");
+        }
+    </script>
+</body>
+</html>

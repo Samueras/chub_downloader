@@ -8,6 +8,7 @@ import shutil
 import threading
 import queue
 import logging
+import time
 from PIL import Image, ImageTk, PngImagePlugin
 import markdown  # For markdown conversion
 
@@ -17,6 +18,9 @@ from ttkbootstrap.constants import *
 from tkinter import messagebox, filedialog
 import re  # Import regular expressions module
 import tkinter as tk # For Canvas widget
+
+# Reuse the authenticated "own cards" lookup from the stats server.
+import chub_stats_server
 
 # Determine application path for PyInstaller compatibility
 import sys
@@ -106,6 +110,41 @@ def save_config():
         config.write(configfile)
 
 MAX_AI_RATING_API_CALLS = 8 # Max calls: 1 (for initial check) + ceil(log2(100))=7
+# Delay between consecutive Chub API calls to avoid rate-limiting / read timeouts.
+API_CALL_DELAY = 1.0 # seconds
+
+# Retry policy for HTTP 429 rate-limit responses, mirroring the ForksScanner
+# smartFetch approach: up to 5 retries with exponential backoff (5s, 10s, 20s,
+# 40s, 80s) before giving up.
+RATE_LIMIT_MAX_RETRIES = 5
+RATE_LIMIT_BASE_DELAY = 5.0 # seconds
+
+def request_with_retry(url, headers=None, timeout=30, stream=False, status_var=None, context_label=""):
+    """GET request that retries on HTTP 429 with exponential backoff.
+
+    Mirrors ForksScanner.html's smartFetch: max 5 retries, delays of 5s, 10s,
+    20s, 40s, 80s. Other HTTP/network errors are raised immediately (no retry).
+    Returns the requests.Response on success.
+    """
+    for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        response = requests.get(url, headers=headers, timeout=timeout, stream=stream)
+        if response.status_code != 429:
+            return response
+        # Rate limited — back off and retry unless we're out of attempts.
+        if attempt >= RATE_LIMIT_MAX_RETRIES:
+            logging.error(f"HTTP 429 max retries reached for {url}")
+            response.raise_for_status()  # raises HTTPError for the 429
+            return response  # defensive; raise_for_status above will have raised
+        delay = RATE_LIMIT_BASE_DELAY * (2 ** attempt)
+        logging.warning(f"Rate limit (429) hit for {url}. Retry {attempt+1}/{RATE_LIMIT_MAX_RETRIES} after {delay}s.")
+        if status_var:
+            try:
+                status_var.set(f"{context_label}Rate limited, retrying in {int(delay)}s (attempt {attempt+1}/{RATE_LIMIT_MAX_RETRIES})...")
+            except Exception:
+                pass
+        time.sleep(delay)
+    # Unreachable, but keeps the linter happy.
+    return response
 
 def _check_card_rating_api(full_path_query, target_card_id, min_rating_to_check, headers, status_var, current_api_call_num):
     """Helper function to check if a card appears in search with a given min_ai_rating."""
@@ -129,6 +168,9 @@ def _check_card_rating_api(full_path_query, target_card_id, min_rating_to_check,
         if status_var:
             status_var.set(f"API error checking rating. See logs.")
         return False # Assume not found on error to prevent infinite loops or wrong rating
+    finally:
+        # Throttle to avoid read timeouts / rate limits during the rating binary search.
+        time.sleep(API_CALL_DELAY)
 
 def determine_ai_rating(selected_node_data, headers, status_var=None):
     """Determines the AI rating of a card using binary search on the search API."""
@@ -252,6 +294,152 @@ def set_api_token():
     save_button = ttk.Button(token_window, text="Save Token", command=save_token, style='Custom.TButton')
     save_button.pack(pady=(0, 10))
 
+class CreatorLookupPopup(tk.Toplevel):
+    """Popup to look up a Chub creator's numeric ID by username."""
+    def __init__(self, parent, headers):
+        super().__init__(parent)
+        self.title("Look up Creator ID")
+        self.parent = parent
+        self.headers = headers
+        self.creator_id = None  # Set when the user confirms a found creator
+
+        self.transient(parent)
+        self.grab_set()
+
+        main_frame = ttk.Frame(self, padding="15")
+        main_frame.pack(fill=BOTH, expand=True)
+
+        ttk.Label(main_frame, text="Enter a creator username to look up their ID:").pack(anchor='w', pady=(0, 5))
+
+        entry_frame = ttk.Frame(main_frame)
+        entry_frame.pack(fill=X, pady=2)
+        self.creator_name_var = tk.StringVar()
+        self.name_entry = ttk.Entry(entry_frame, textvariable=self.creator_name_var, width=40)
+        self.name_entry.pack(side=LEFT, fill=X, expand=YES)
+        self.name_entry.bind('<Return>', lambda e: self.perform_lookup())
+        self.name_entry.focus_set()
+
+        self.lookup_button = ttk.Button(entry_frame, text="Look up", command=self.perform_lookup, style='Custom.TButton')
+        self.lookup_button.pack(side=LEFT, padx=(5, 0))
+
+        # Result area (avatar + id/username populated after a lookup)
+        self.result_frame = ttk.Frame(main_frame)
+        self.result_frame.pack(fill=X, pady=(10, 0))
+        self.result_frame.grid_columnconfigure(0, weight=1)
+
+        # Status line
+        self.status_var = tk.StringVar()
+        self.status_label = ttk.Label(main_frame, textvariable=self.status_var, font=('Segoe UI', 9))
+        self.status_label.pack(anchor='w', pady=(5, 0))
+
+        # Action buttons
+        action_frame = ttk.Frame(main_frame)
+        action_frame.pack(side=BOTTOM, fill=X, pady=(10, 0))
+        self.use_button = ttk.Button(action_frame, text="Use this ID", command=self.use_id, state=DISABLED, style='Custom.TButton')
+        self.use_button.pack(side=LEFT, padx=5)
+        ttk.Button(action_frame, text="Close", command=self.on_close).pack(side=LEFT)
+
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def perform_lookup(self):
+        name = self.creator_name_var.get().strip()
+        if not name:
+            messagebox.showwarning("Input Error", "Please enter a creator username.", parent=self)
+            return
+
+        self.lookup_button.config(state=DISABLED)
+        self.use_button.config(state=DISABLED)
+        self.status_var.set(f"Looking up '{name}'...")
+        threading.Thread(target=self._do_lookup, args=(name,), daemon=True).start()
+
+    def _do_lookup(self, name):
+        try:
+            url = f"https://api.chub.ai/api/users/{name}?nsfl=true&exclude_mine=false&include_projects=false"
+            response = requests.get(url, headers=self.headers, timeout=15)
+
+            if response.status_code == 404:
+                self.parent.after(0, lambda: self._show_not_found(name))
+                return
+            response.raise_for_status()
+            data = response.json()
+
+            if not data or 'id' not in data or data.get('error'):
+                self.parent.after(0, lambda: self._show_not_found(name))
+                return
+
+            self.parent.after(0, lambda: self._show_result(data))
+        except requests.exceptions.RequestException as e:
+            self.parent.after(0, lambda: self._show_error(str(e)))
+        except Exception as e:
+            self.parent.after(0, lambda: self._show_error(str(e)))
+
+    def _clear_result(self):
+        for widget in self.result_frame.winfo_children():
+            widget.destroy()
+
+    def _show_result(self, data):
+        self._clear_result()
+
+        creator_id = data.get('id')
+        username = data.get('username', 'N/A')
+        display_name = data.get('name', '') or ''
+        avatar_url = data.get('avatar_url')
+
+        self.creator_id = str(creator_id)
+
+        info_text = f"ID: {creator_id}    Username: {username}"
+        if display_name:
+            info_text += f"    Name: {display_name}"
+        ttk.Label(self.result_frame, text=info_text, font=('Segoe UI', 10, 'bold')).grid(row=0, column=0, sticky='w')
+
+        if avatar_url:
+            img_label = ttk.Label(self.result_frame)
+            img_label.grid(row=1, column=0, sticky='w', pady=(5, 0))
+            threading.Thread(target=self._load_avatar, args=(avatar_url, img_label), daemon=True).start()
+
+        self.status_var.set("Creator found. Click 'Use this ID' to fill in the field.")
+        self.use_button.config(state=NORMAL)
+        self.lookup_button.config(state=NORMAL)
+
+    def _show_not_found(self, name):
+        self._clear_result()
+        self.creator_id = None
+        self.status_var.set(f"No creator found with username '{name}'.")
+        self.lookup_button.config(state=NORMAL)
+        self.use_button.config(state=DISABLED)
+
+    def _show_error(self, error_msg):
+        self._clear_result()
+        self.creator_id = None
+        self.status_var.set(f"Error: {error_msg}")
+        self.lookup_button.config(state=NORMAL)
+        self.use_button.config(state=DISABLED)
+
+    def _load_avatar(self, url, img_label):
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            response = requests.get(url, headers=headers, stream=True, timeout=10)
+            response.raise_for_status()
+            image = Image.open(BytesIO(response.content))
+            image.thumbnail((80, 80))
+            photo = ImageTk.PhotoImage(image)
+            img_label.image = photo  # prevent garbage collection
+            self.parent.after(0, lambda: img_label.config(image=photo, text=""))
+        except Exception as e:
+            logging.error(f"Error loading avatar from {url}: {e}")
+            self.parent.after(0, lambda: img_label.config(text="Avatar N/A"))
+
+    def use_id(self):
+        # Keep self.creator_id set; parent reads it after the window closes.
+        self.grab_release()
+        self.destroy()
+
+    def on_close(self):
+        self.creator_id = None
+        self.grab_release()
+        self.destroy()
+
+
 class AdvancedSearchPopup(tk.Toplevel):
     def __init__(self, parent, headers):
         super().__init__(parent)
@@ -320,7 +508,11 @@ class AdvancedSearchPopup(tk.Toplevel):
         ttk.Label(filters_frame, text="Max Days Ago:").grid(row=2, column=0, sticky='w', pady=2, padx=5)
         ttk.Entry(filters_frame, textvariable=self.max_days_ago_var).grid(row=2, column=1, sticky='we', pady=2, padx=5)
         ttk.Label(filters_frame, text="Creator ID:").grid(row=2, column=2, sticky='w', pady=2, padx=5)
-        ttk.Entry(filters_frame, textvariable=self.creator_id_var).grid(row=2, column=3, sticky='we', pady=2, padx=5)
+        creator_id_frame = ttk.Frame(filters_frame)
+        creator_id_frame.grid(row=2, column=3, sticky='we', pady=2, padx=5)
+        creator_id_frame.grid_columnconfigure(0, weight=1)
+        ttk.Entry(creator_id_frame, textvariable=self.creator_id_var).grid(row=0, column=0, sticky='we')
+        ttk.Button(creator_id_frame, text="🔍", width=3, command=self.open_creator_lookup).grid(row=0, column=1, padx=(2, 0))
 
         ttk.Label(filters_frame, text="Tags (csv):").grid(row=3, column=0, sticky='w', pady=2, padx=5)
         ttk.Entry(filters_frame, textvariable=self.topics_var).grid(row=3, column=1, sticky='we', pady=2, padx=5)
@@ -344,6 +536,12 @@ class AdvancedSearchPopup(tk.Toplevel):
         self.search_button = ttk.Button(action_frame, text="Search", command=self.start_advanced_search, style='Custom.TButton')
         self.search_button.pack(side=LEFT, padx=5)
         ttk.Button(action_frame, text="Cancel", command=self.on_close).pack(side=LEFT)
+
+    def open_creator_lookup(self):
+        popup = CreatorLookupPopup(self, self.headers)
+        self.wait_window(popup)
+        if popup.creator_id:
+            self.creator_id_var.set(popup.creator_id)
 
     def save_filters_to_config(self):
         if not config.has_section('AdvancedSearch'):
@@ -408,7 +606,7 @@ class AdvancedSearchPopup(tk.Toplevel):
                 'min_tokens': self.min_tokens_var.get(),
                 'max_tokens': self.max_tokens_var.get(),
                 'max_days_ago': self.max_days_ago_var.get(),
-                'creator': self.creator_id_var.get(),
+                'creator_id': self.creator_id_var.get(),
                 'topics': self.topics_var.get(),
                 'exclude_topics': self.exclude_topics_var.get(),
                 'first': 20, # Corresponds to results_per_page in CardSelectionPopup
@@ -420,6 +618,14 @@ class AdvancedSearchPopup(tk.Toplevel):
             if self.nsfw_var.get(): search_params['nsfw'] = 'true'
             if self.nsfl_var.get(): search_params['nsfl'] = 'true'
 
+            # The Chub API returns 0 results when combining sort=trending with a
+            # creator_id filter (server-side limitation). Fall back to a sort
+            # that supports creator filtering so the user still gets results.
+            if search_params.get('creator_id') and search_params.get('sort') == 'trending':
+                fallback_sort = 'download_count'
+                logging.info("sort=trending is incompatible with creator_id; falling back to %s.", fallback_sort)
+                search_params['sort'] = fallback_sort
+
             response = requests.get(base_url, headers=self.headers, params=search_params)
             response.raise_for_status()
             api_response_data = response.json()
@@ -427,23 +633,19 @@ class AdvancedSearchPopup(tk.Toplevel):
             nodes = api_response_data.get('data', {}).get('nodes', [])
             count = api_response_data.get('data', {}).get('count', 0)
 
-            result_queue = queue.Queue()
             if count == 0:
                 self.parent.after(0, lambda: messagebox.showinfo("No Results", "No cards found with the specified criteria."))
                 self.parent.after(0, self.on_close)
                 return
             elif count == 1:
-                result_queue.put(nodes[0])
-            else:
-                self.parent.after(0, lambda: self.show_selection_popup(api_response_data, result_queue))
-            
-            selected_node = result_queue.get() # This will block until a card is selected or popup is closed
-
-            if selected_node:
-                self.parent.after(0, lambda: self.start_download(selected_node))
-            else:
-                # This case happens if the selection popup is closed without a selection
+                # Single result: download directly, no selection popup needed.
+                self.parent.after(0, lambda: self.start_download(nodes[0]))
                 self.parent.after(0, self.on_close)
+            else:
+                # Multiple results: open the selection popup with a download
+                # callback so the user can download multiple cards from the
+                # same search without the window closing.
+                self.parent.after(0, lambda: self.show_selection_popup(api_response_data, search_params))
 
         except requests.exceptions.HTTPError as http_err:
             try:
@@ -457,15 +659,27 @@ class AdvancedSearchPopup(tk.Toplevel):
             self.parent.after(0, lambda: messagebox.showerror("Error", f"An unexpected error occurred: {err}"))
             self.parent.after(0, self.on_close)
 
-    def show_selection_popup(self, api_response, result_queue):
-        # This method now correctly handles the modal nature of the popup
-        # and ensures the main flow waits for a selection.
-        popup = CardSelectionPopup(self.parent, self.search_query_var.get(), api_response, self.headers)
-        # The parent waits for the popup to be destroyed
-        self.parent.wait_window(popup)
-        # After popup is closed, get the result from it
-        result_queue.put(popup.selected_card_node)
-        self.destroy() # Close the advanced search window
+    def show_selection_popup(self, api_response, search_params):
+        # Opens the selection popup with a download callback. The popup stays
+        # open after each download so the user can pick multiple cards.
+        # search_params is reused for pagination so filters stay consistent
+        # across pages. When the popup closes, the Search button is re-enabled
+        # so a new search can be run without reopening this window.
+        def on_results_closed():
+            try:
+                self.search_button.config(state=NORMAL)
+            except Exception:
+                pass
+
+        popup = CardSelectionPopup(
+            self.parent,
+            self.search_query_var.get(),
+            api_response,
+            self.headers,
+            download_callback=self.start_download,
+            search_params=search_params,
+            on_close_callback=on_results_closed,
+        )
 
     def start_download(self, node):
         bundle_option = var.get()
@@ -474,7 +688,6 @@ class AdvancedSearchPopup(tk.Toplevel):
         # Disable buttons in the main app window
         set_ui_state(DISABLED)
         threading.Thread(target=download_card_thread, args=(node, bundle_option, output_directory, self.headers, None, status_var, set_ui_state), daemon=True).start()
-        self.destroy()
 
     def on_close(self):
         self.grab_release()
@@ -486,7 +699,7 @@ class AdvancedSearchPopup(tk.Toplevel):
         return self.selected_card_node
 
 class CardSelectionPopup(ttk.Toplevel):
-    def __init__(self, parent, query, initial_response, headers):
+    def __init__(self, parent, query, initial_response, headers, download_callback=None, search_params=None, on_close_callback=None):
         super().__init__(parent)
         self.title("Select a Card")
         self.geometry("700x650")
@@ -494,6 +707,17 @@ class CardSelectionPopup(ttk.Toplevel):
         self.query = query
         self.headers = headers
         self.selected_card_node = None
+        # When set, clicking "Download this Card" invokes this callback with the
+        # node and keeps the popup open, allowing multiple downloads per search.
+        self.download_callback = download_callback
+        # Full filter dict used for the original search; reused for pagination so
+        # filters (creator_id, sort, topics, ...) stay consistent across pages.
+        self.search_params = dict(search_params) if search_params else {
+            'search': query, 'nsfw': 'true', 'nsfl': 'true'
+        }
+        # Optional callback invoked after this popup closes (e.g. to re-enable
+        # the parent's Search button so a new search can be run).
+        self.on_close_callback = on_close_callback
 
         self.page_cache = {}
         self.image_cache = {}
@@ -612,8 +836,10 @@ class CardSelectionPopup(ttk.Toplevel):
 
     def fetch_and_display_page(self, page_number):
         try:
-            search_url = f"https://api.chub.ai/search?search={self.query}&page={page_number}&first={self.results_per_page}&nsfw=true&nsfl=true"
-            response = requests.get(search_url, headers=self.headers, timeout=15)
+            params = dict(self.search_params)
+            params['page'] = page_number
+            params['first'] = self.results_per_page
+            response = requests.get("https://api.chub.ai/search", headers=self.headers, params=params, timeout=15)
             response.raise_for_status()
             data = response.json()
             nodes = data.get('data', {}).get('nodes', [])
@@ -632,8 +858,10 @@ class CardSelectionPopup(ttk.Toplevel):
         if page_number in self.page_cache: # Double check before fetching
             return
         try:
-            search_url = f"https://api.chub.ai/search?search={self.query}&page={page_number}&first={self.results_per_page}&nsfw=true&nsfl=true"
-            response = requests.get(search_url, headers=self.headers, timeout=15)
+            params = dict(self.search_params)
+            params['page'] = page_number
+            params['first'] = self.results_per_page
+            response = requests.get("https://api.chub.ai/search", headers=self.headers, params=params, timeout=15)
             response.raise_for_status()
             data = response.json()
             nodes = data.get('data', {}).get('nodes', [])
@@ -654,6 +882,10 @@ class CardSelectionPopup(ttk.Toplevel):
         self.go_to_page(self.current_page - 1)
 
     def on_select(self, card_node):
+        if self.download_callback:
+            # Multi-download mode: keep the popup open so the user can pick more.
+            self.download_callback(card_node)
+            return
         self.selected_card_node = card_node
         self.on_close()
 
@@ -661,6 +893,11 @@ class CardSelectionPopup(ttk.Toplevel):
         self.selected_card_node = None # Ensure nothing is returned if closed
         self.grab_release()
         self.destroy()
+        if self.on_close_callback:
+            try:
+                self.on_close_callback()
+            except Exception as e:
+                logging.error(f"CardSelectionPopup on_close_callback failed: {e}")
 
     def show(self):
         self.wait_window(self)
@@ -797,7 +1034,7 @@ def download_card_direct():
         token_button.config(state=NORMAL)
         select_output_button.config(state=NORMAL)
 
-def download_card_thread(node, bundle_option, output_directory, headers, ai_rating, status_var, ui_callback=None):
+def download_card_thread(node, bundle_option, output_directory, headers, ai_rating, status_var, ui_callback=None, suppress_popup=False, batch_prefix=""):
     try:
         # Check if a card was actually selected/found before proceeding
         if not node:
@@ -822,25 +1059,20 @@ def download_card_thread(node, bundle_option, output_directory, headers, ai_rati
         if not os.path.exists(card_dir):
             os.makedirs(card_dir)
 
-        # Save description and additional information as HTML using markdown and a template
-        html_content = generate_html(node)
-        with open(os.path.join(card_dir, f"{sanitized_name}_info.html"), 'w', encoding='utf-8') as f:
-            f.write(html_content)
-
         # Download PNG using max_res_url from the search result node
         max_res_url = node.get('max_res_url')
         if not max_res_url:
             messagebox.showerror("Download Error", "Could not find 'max_res_url' for the selected card to download the image.")
             logging.error(f"max_res_url not found for card {full_path}")
         else:
-            status_var.set(f"Downloading card image from {max_res_url[:50]}...")
+            status_var.set(f"{batch_prefix}Downloading card image from {max_res_url[:50]}...")
             try:
-                image_response = requests.get(max_res_url, headers=headers, stream=True, timeout=30)
+                image_response = request_with_retry(max_res_url, headers=headers, timeout=30, stream=True, status_var=status_var, context_label=batch_prefix)
                 image_response.raise_for_status()
                 with open(os.path.join(card_dir, f"{sanitized_name}.png"), 'wb') as img_file:
                     for chunk in image_response.iter_content(chunk_size=8192):
                         img_file.write(chunk)
-                status_var.set("Card image downloaded.")
+                status_var.set(f"{batch_prefix}Card image downloaded.")
             except requests.exceptions.RequestException as img_err:
                 messagebox.showerror("Image Download Error", f"Failed to download card image from {max_res_url}: {img_err}")
                 logging.error(f"Failed to download card image from {max_res_url}: {img_err}")
@@ -849,18 +1081,19 @@ def download_card_thread(node, bundle_option, output_directory, headers, ai_rati
         logging.info(f"Attempting to fetch gallery for card_id: {card_id}")
         gallery_url = f"https://api.chub.ai/api/gallery/project/{card_id}?nsfw=true&page=1&limit=24"
         logging.info(f"Fetching gallery from: {gallery_url}")
+        gallery_images = []  # Filenames of successfully downloaded gallery images
         try:
-            response = requests.get(gallery_url, headers=headers, timeout=15)
+            response = request_with_retry(gallery_url, headers=headers, timeout=15, status_var=status_var, context_label=batch_prefix)
             logging.info(f"Gallery API response status: {response.status_code}")
             response.raise_for_status()
             gallery_data = response.json()
             logging.info(f"Gallery data received: {json.dumps(gallery_data, indent=2)}")
-            
+
             nodes = gallery_data.get('nodes', [])
             gallery_count = len(nodes) # Use the actual length of the nodes list, not the 'count' field
 
             if gallery_count > 0:
-                status_var.set(f"Downloading {gallery_count} gallery images...")
+                status_var.set(f"{batch_prefix}Downloading {gallery_count} gallery images...")
                 for i, image_node in enumerate(nodes):
                     # The correct key for the gallery image URL is 'primary_image_path'
                     image_url = image_node.get('primary_image_path')
@@ -869,15 +1102,16 @@ def download_card_thread(node, bundle_option, output_directory, headers, ai_rati
                         continue
 
                     logging.info(f"Attempting to download gallery image from URL: {image_url}")
-                    status_var.set(f"Downloading gallery image {i+1}/{len(nodes)}...")
+                    status_var.set(f"{batch_prefix}Downloading gallery image {i+1}/{len(nodes)}...")
                     try:
-                        image_response = requests.get(image_url, timeout=30)
+                        image_response = request_with_retry(image_url, timeout=30, status_var=status_var, context_label=batch_prefix)
                         image_response.raise_for_status()
                         image_name = image_url.split('/')[-1].split('?')[0] # Clean query params
                         sanitized_image_name = sanitize_filename(image_name)
                         file_path = os.path.join(card_dir, sanitized_image_name)
                         with open(file_path, 'wb') as img_file:
                             img_file.write(image_response.content)
+                        gallery_images.append(sanitized_image_name)
                         logging.info(f"Successfully downloaded and saved gallery image to {file_path}")
                     except requests.exceptions.RequestException as img_err:
                         logging.error(f"Failed to download gallery image {image_url}: {img_err}")
@@ -885,6 +1119,12 @@ def download_card_thread(node, bundle_option, output_directory, headers, ai_rati
                 logging.info("No gallery images found for this card.")
         except requests.exceptions.RequestException as e:
             logging.error(f"Failed to fetch gallery images: {e}")
+
+        # Generate the HTML after gallery download so it can embed an interactive
+        # gallery referencing the downloaded image files.
+        html_content = generate_html(node, gallery_images=gallery_images)
+        with open(os.path.join(card_dir, f"{sanitized_name}_info.html"), 'w', encoding='utf-8') as f:
+            f.write(html_content)
 
         # Bundle option
         if bundle_option == 'Zip':
@@ -894,10 +1134,12 @@ def download_card_thread(node, bundle_option, output_directory, headers, ai_rati
                     zipf.write(os.path.join(root, file), arcname=file)
             zipf.close()
             shutil.rmtree(card_dir)
-            messagebox.showinfo("Success", f"All files have been saved and zipped at {card_dir}.zip")
+            if not suppress_popup:
+                messagebox.showinfo("Success", f"All files have been saved and zipped at {card_dir}.zip")
             status_var.set("Download complete. Ready.")
         else:
-            messagebox.showinfo("Success", f"All files have been saved in {card_dir}")
+            if not suppress_popup:
+                messagebox.showinfo("Success", f"All files have been saved in {card_dir}")
             status_var.set("Download complete. Ready.")
 
     except Exception as err:
@@ -950,29 +1192,30 @@ def search_and_select_card():
         nodes = initial_response.get('data', {}).get('nodes', [])
         count = initial_response.get('data', {}).get('count', 0)
 
-        node = None # Initialize node
         if count == 0:
             messagebox.showinfo("No Results", "No card found with the given name.")
             status_var.set("No results found. Ready.")
             return
-        elif count == 1:
-            node = nodes[0]
-            status_var.set(f"Found card: {node.get('name', 'Unknown')}. Proceeding...")
-        else:
-            status_var.set(f"Multiple cards found ({count}). Awaiting selection...")
-            popup = CardSelectionPopup(app, name, initial_response, headers)
-            selected_card_node = popup.show()
-            if selected_card_node:
-                node = selected_card_node
-                status_var.set(f"Card selected: {node.get('name', 'Unknown')}. Proceeding...")
-            else:
-                status_var.set("Card selection cancelled. Ready.")
-                return
 
-        if node:
+        def download_selected(node):
+            status_var.set(f"Card selected: {node.get('name', 'Unknown')}. Proceeding...")
             status_var.set(f"Preparing to determine AI rating for {node.get('name', 'Unknown')}...")
             ai_rating, calls_made = determine_ai_rating(node, headers, status_var)
             download_card_thread(node, bundle_option, output_directory, headers, ai_rating, status_var)
+
+        if count == 1:
+            node = nodes[0]
+            status_var.set(f"Found card: {node.get('name', 'Unknown')}. Proceeding...")
+            download_selected(node)
+        else:
+            status_var.set(f"Multiple cards found ({count}). Awaiting selection...")
+            def download_callback(node):
+                # Run in a thread so the popup stays responsive for more picks.
+                threading.Thread(target=download_selected, args=(node,), daemon=True).start()
+            regular_search_params = {
+                'search': name, 'nsfw': 'true', 'nsfl': 'true', 'count': 'true'
+            }
+            popup = CardSelectionPopup(app, name, initial_response, headers, download_callback=download_callback, search_params=regular_search_params)
 
     except requests.exceptions.RequestException as e:
         status_var.set(f"API Error: {e}")
@@ -985,15 +1228,176 @@ def search_and_select_card():
         # Always re-enable UI
         app.after(0, set_ui_state, NORMAL)
 
+def download_all_own_cards():
+    """Download every card owned by the logged-in user, including private ones.
+
+    Requires the Chub session token (set via 'Set Chub.ai Token'), because the
+    authenticated /api/users/{creator}?include_projects=true endpoint is the
+    only way to see your own private/unlisted cards.
+    """
+    api_token = config['Settings'].get('api_token', '').strip()
+    if not api_token:
+        messagebox.showwarning(
+            "Session Token Required",
+            "Downloading your own bots (including private ones) requires your "
+            "Chub session token.\n\n"
+            "To set it:\n"
+            "1. Log in to chub.ai in your browser.\n"
+            "2. Open DevTools (F12) -> Application -> Cookies -> https://chub.ai.\n"
+            "3. Copy the value of the 'session' cookie.\n"
+            "4. Click 'Set Chub.ai Token' here and paste it.\n\n"
+            "Then try again.",
+        )
+        status_var.set("Session token not set. Cannot download own bots.")
+        return
+
+    output_directory = output_dir.get()
+    if not output_directory:
+        messagebox.showwarning("Output Directory Not Set", "Please select an output directory.")
+        return
+
+    bundle_option = var.get()
+    headers = {
+        'accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    if api_token:
+        headers['Authorization'] = f'Bearer {api_token}'
+
+    try:
+        # Verify the token and resolve the creator's username from /api/self.
+        status_var.set("Verifying session token...")
+        account = chub_stats_server.fetch_account_info(api_token)
+        if not account.get('authenticated'):
+            messagebox.showerror(
+                "Token Not Valid",
+                "Your session token could not be verified. Please re-set it via "
+                "'Set Chub.ai Token'.\n\n"
+                "Make sure you copied the 'session' cookie value (not the auth "
+                "header), and that you are still logged in on chub.ai.",
+            )
+            status_var.set("Token verification failed. Ready.")
+            return
+
+        creator = account.get('user_name') or account.get('name')
+        if not creator:
+            messagebox.showerror("Account Error", "Could not determine your username from the account info.")
+            status_var.set("Could not resolve account username. Ready.")
+            return
+
+        # Fetch all the user's cards (includes private/unlisted when authenticated).
+        status_var.set(f"Fetching bot list for '{creator}'...")
+        nodes = chub_stats_server.fetch_all_cards(api_token, creator)
+        if not nodes:
+            messagebox.showinfo("No Bots Found", f"No bots were found for the account '{creator}'.")
+            status_var.set("No own bots found. Ready.")
+            return
+
+        # Confirm before downloading a potentially large batch.
+        confirm = messagebox.askyesno(
+            "Download All Own Bots",
+            f"Found {len(nodes)} bot(s) for '{creator}'.\n\nDownload all of them to:\n{output_directory}\n?",
+        )
+        if not confirm:
+            status_var.set("Download cancelled. Ready.")
+            return
+
+        # Pre-scan: detect cards whose destination (folder or zip, depending on
+        # the selected bundle option) already exists in the output directory.
+        existing = []
+        for node in nodes:
+            sanitized_name = sanitize_filename(node.get('name', 'Unknown'))
+            if bundle_option == 'Zip':
+                dest = os.path.join(output_directory, f"{sanitized_name}.zip")
+            else:
+                dest = os.path.join(output_directory, sanitized_name)
+            if os.path.exists(dest):
+                existing.append(node.get('name', 'Unknown'))
+
+        # Ask once how to handle already-downloaded cards.
+        # skip_existing=True -> skip them; False -> re-download (overwrite).
+        skip_existing = False
+        if existing:
+            choice = messagebox.askyesnocancel(
+                "Existing Cards Found",
+                f"{len(existing)} of {len(nodes)} card(s) already exist in the output directory:\n- "
+                + "\n- ".join(existing[:10])
+                + ("\n... (and {} more)".format(len(existing) - 10) if len(existing) > 10 else "")
+                + "\n\nYes = skip existing cards\nNo = overwrite existing cards\nCancel = abort download",
+            )
+            if choice is None:
+                status_var.set("Download cancelled. Ready.")
+                return
+            skip_existing = bool(choice)
+
+        success = 0
+        failed = []
+        skipped = 0
+        for i, node in enumerate(nodes, start=1):
+            card_name = node.get('name', 'Unknown')
+            # Short name for status display: first 10 chars, with "..." if truncated.
+            short_name = card_name[:10] + ("..." if len(card_name) > 10 else "")
+            sanitized_name = sanitize_filename(card_name)
+            if bundle_option == 'Zip':
+                dest = os.path.join(output_directory, f"{sanitized_name}.zip")
+            else:
+                dest = os.path.join(output_directory, sanitized_name)
+
+            # Honor the skip/overwrite choice from the pre-scan.
+            if skip_existing and os.path.exists(dest):
+                logging.info(f"Skipping '{card_name}' (already exists at {dest}).")
+                skipped += 1
+                status_var.set(f"DL: {i}/{len(nodes)} {short_name} Skipping (already exists)...")
+                continue
+
+            # Prefix prepended to every status line for this card so the user can
+            # see which bot is being processed within the overall batch.
+            batch_prefix = f"DL: {i}/{len(nodes)} {short_name} "
+            status_var.set(f"{batch_prefix}Downloading...")
+            try:
+                ai_rating, _ = determine_ai_rating(node, headers, status_var)
+                download_card_thread(node, bundle_option, output_directory, headers, ai_rating, status_var, suppress_popup=True, batch_prefix=batch_prefix)
+                success += 1
+            except Exception as exc:
+                logging.error(f"Failed to download '{card_name}': {exc}")
+                failed.append(card_name)
+            # Throttle between cards to avoid read timeouts / rate limits.
+            if i < len(nodes):
+                time.sleep(API_CALL_DELAY)
+
+        if failed:
+            messagebox.showwarning(
+                "Download Complete (with errors)",
+                f"Downloaded {success}/{len(nodes)} bot(s).\nSkipped: {skipped}\n\nFailed:\n- " + "\n- ".join(failed),
+            )
+        else:
+            messagebox.showinfo("Download Complete", f"Successfully downloaded {success} bot(s).\nSkipped: {skipped}.")
+        status_var.set(f"Downloaded {success}/{len(nodes)} own bots (skipped {skipped}). Ready.")
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Network error while downloading own bots: {e}")
+        messagebox.showerror("API Error", f"Failed to communicate with Chub.ai API: {e}")
+        status_var.set("API error. Ready.")
+    except Exception as err:
+        logging.error(f"Error downloading own bots: {err}")
+        messagebox.showerror("Error", f"An error occurred: {err}")
+        status_var.set("Error occurred. Ready.")
+
+def on_download_all_own_click():
+    set_ui_state(DISABLED)
+    threading.Thread(target=download_all_own_cards, daemon=True).start()
+
 def download_card():
     """
     Initiates the download process in a separate thread.
     """
     threading.Thread(target=download_card_thread).start()
 
-def generate_html(node):
+def generate_html(node, gallery_images=None):
     """
     Generates an HTML file with card information and description.
+    gallery_images: optional list of local image filenames (in the same folder
+    as this HTML file) to render as an interactive gallery.
     """
     # Convert markdown description to HTML
     description_html = markdown.markdown(node.get('description', ''))
@@ -1152,6 +1556,95 @@ def generate_html(node):
                     grid-template-columns: 1fr 1fr 1fr;
                 }}
             }}
+            .gallery {{
+                margin-top: 30px;
+            }}
+            .gallery h2 {{
+                border-bottom: 2px solid #e7e7e7;
+                padding-bottom: 10px;
+                color: {highlight_color};
+            }}
+            .gallery-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+                gap: 10px;
+                margin-top: 15px;
+            }}
+            .gallery-grid figure {{
+                margin: 0;
+                cursor: pointer;
+                border-radius: 6px;
+                overflow: hidden;
+                background: #fafafa;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+                transition: transform 0.12s ease;
+            }}
+            .gallery-grid figure:hover {{
+                transform: scale(1.03);
+            }}
+            .gallery-grid img {{
+                width: 100%;
+                height: 140px;
+                object-fit: cover;
+                display: block;
+            }}
+            .lightbox {{
+                display: none;
+                position: fixed;
+                inset: 0;
+                background: rgba(0,0,0,0.85);
+                z-index: 9999;
+                justify-content: center;
+                align-items: center;
+                padding: 30px;
+            }}
+            .lightbox.active {{
+                display: flex;
+            }}
+            .lightbox img {{
+                max-width: 90vw;
+                max-height: 85vh;
+                border-radius: 6px;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+            }}
+            .lightbox-close {{
+                position: absolute;
+                top: 18px;
+                right: 28px;
+                color: #fff;
+                font-size: 36px;
+                cursor: pointer;
+                user-select: none;
+                line-height: 1;
+            }}
+            .lightbox-nav {{
+                position: absolute;
+                top: 50%;
+                transform: translateY(-50%);
+                color: #fff;
+                font-size: 48px;
+                cursor: pointer;
+                user-select: none;
+                padding: 16px;
+                line-height: 1;
+                opacity: 0.7;
+            }}
+            .lightbox-nav:hover {{
+                opacity: 1;
+            }}
+            .lightbox-prev {{ left: 10px; }}
+            .lightbox-next {{ right: 10px; }}
+            .lightbox-counter {{
+                position: absolute;
+                bottom: 20px;
+                left: 50%;
+                transform: translateX(-50%);
+                color: #fff;
+                font-size: 14px;
+                background: rgba(0,0,0,0.5);
+                padding: 6px 14px;
+                border-radius: 12px;
+            }}
         </style>
     </head>
     <body>
@@ -1216,6 +1709,68 @@ def generate_html(node):
             </div>
         """
 
+    # Add interactive gallery if gallery images were downloaded.
+    if gallery_images:
+        # Escape filenames for safe embedding in HTML/JS.
+        thumbnails_html = "\n".join(
+            f'                <figure data-index="{i}"><img src="{fn}" alt="Gallery image {i+1}" loading="lazy"></figure>'
+            for i, fn in enumerate(gallery_images)
+        )
+        # JSON-encode the list so JS gets a clean array (handles quoting/escaping).
+        images_json = json.dumps(gallery_images)
+        gallery_count = len(gallery_images)
+        html_template += f"""
+            <div class="gallery">
+                <h2>Gallery ({gallery_count})</h2>
+                <div class="gallery-grid">
+{thumbnails_html}
+                </div>
+            </div>
+            <div class="lightbox" id="lightbox">
+                <span class="lightbox-close" id="lightbox-close">&times;</span>
+                <span class="lightbox-nav lightbox-prev" id="lightbox-prev">&#8249;</span>
+                <img id="lightbox-img" src="" alt="">
+                <span class="lightbox-nav lightbox-next" id="lightbox-next">&#8250;</span>
+                <span class="lightbox-counter" id="lightbox-counter"></span>
+            </div>
+            <script>
+                (function() {{
+                    const images = {images_json};
+                    let current = 0;
+                    const box = document.getElementById('lightbox');
+                    const boxImg = document.getElementById('lightbox-img');
+                    const counter = document.getElementById('lightbox-counter');
+
+                    function show(index) {{
+                        current = (index + images.length) % images.length;
+                        boxImg.src = images[current];
+                        counter.textContent = (current + 1) + ' / ' + images.length;
+                    }}
+
+                    document.querySelectorAll('.gallery-grid figure').forEach(fig => {{
+                        fig.addEventListener('click', () => {{
+                            show(parseInt(fig.dataset.index, 10));
+                            box.classList.add('active');
+                        }});
+                    }});
+
+                    function close() {{ box.classList.remove('active'); }}
+                    document.getElementById('lightbox-close').addEventListener('click', close);
+                    box.addEventListener('click', e => {{ if (e.target === box) close(); }});
+
+                    document.getElementById('lightbox-prev').addEventListener('click', e => {{ e.stopPropagation(); show(current - 1); }});
+                    document.getElementById('lightbox-next').addEventListener('click', e => {{ e.stopPropagation(); show(current + 1); }});
+
+                    document.addEventListener('keydown', e => {{
+                        if (!box.classList.contains('active')) return;
+                        if (e.key === 'Escape') close();
+                        if (e.key === 'ArrowLeft') show(current - 1);
+                        if (e.key === 'ArrowRight') show(current + 1);
+                    }});
+                }})();
+            </script>
+        """
+
     html_template += f"""
         </div>
         <footer>
@@ -1277,9 +1832,12 @@ def select_output_directory():
 select_output_button = ttk.Button(frame, text="Browse", command=select_output_directory, style='Custom.TButton')
 select_output_button.grid(row=2, column=2, sticky=W, padx=(5, 0), pady=(5, 5))
 
-# Set Chub.ai Token Button
+# Set Chub.ai Token Button + Download All Own Bots Button (share row 3)
 token_button = ttk.Button(frame, text="Set Chub.ai Token", command=set_api_token, style='Custom.TButton')
-token_button.grid(row=3, column=0, columnspan=3, sticky=EW, pady=(10, 0))
+token_button.grid(row=3, column=0, columnspan=2, sticky=EW, pady=(10, 0))
+
+download_all_own_button = ttk.Button(frame, text="Download All Own Bots", command=on_download_all_own_click, style='Custom.TButton')
+download_all_own_button.grid(row=3, column=2, sticky=EW, padx=(5, 0), pady=(10, 0))
 
 # Search and Download Buttons Frame
 buttons_frame = ttk.Frame(frame)
@@ -1314,11 +1872,12 @@ def set_ui_state(state):
     search_button.config(state=state)
     advanced_search_button.config(state=state)
     download_url_button.config(state=state)
+    download_all_own_button.config(state=state)
 status_bar = ttk.Label(app, textvariable=status_var, relief=SUNKEN, anchor=W, font=('Segoe UI', 10))
 status_bar.pack(side=BOTTOM, fill=X)
 
 # Version label in lower right corner
-version_label = ttk.Label(app, text="v1.7.2", font=('Segoe UI', 8))
+version_label = ttk.Label(app, text="v1.8.0", font=('Segoe UI', 8))
 version_label.place(relx=1.0, rely=1.0, x=-5, y=-5, anchor='se')
 
 # Run the application

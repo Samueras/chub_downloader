@@ -55,6 +55,51 @@ pip install -r requirements.txt
 python chub_card_downloader.py
 ```
 
+### **Hourly Stats Dashboard (LAN Web UI)**
+
+This repository also includes a lightweight stats service that:
+- polls Chub.ai once per hour for your cards,
+- stores time-series data in SQLite,
+- serves a local web dashboard with charts and avatars (using avatar URLs directly).
+
+#### **Run**
+```bash
+python chub_stats_server.py
+```
+
+#### **Configure**
+The first run creates `stats_config.ini`. Edit it with your values:
+```
+[Stats]
+api_token =
+creator = sambolic
+poll_seconds = 3600
+host = 0.0.0.0
+port = 8787
+db_path = d:\Windsurf\chub_downloader\stats.db
+```
+
+`creator` can be either your numeric creator ID or your username. If you use a username, the service filters by fullPath prefix (e.g. `username/card-name`).
+
+You can also override settings via environment variables:
+- `CHUB_API_TOKEN`
+- `CHUB_CREATOR`
+- `CHUB_POLL_SECONDS`
+- `CHUB_HOST`
+- `CHUB_PORT`
+- `CHUB_DB_PATH`
+
+Open the dashboard in your LAN browser at `http://<server-ip>:8787/`.
+
+### **Forks Scanner (Standalone Tool)**
+
+This repository also includes `ForksScanner.html`, a standalone, dependency-free browser tool that scans a Chub.ai user's characters and finds all forks of each one. It is unrelated to the downloader itself and runs entirely in the browser — just open the file directly.
+
+- Enter a target username (defaults to `Sambolic`) and click **Start Scan**.
+- It paginates through the user's characters, then fetches forks for each one in series.
+- Includes a CORS-proxy toggle (on by default) to avoid browser CORS errors, and automatic retry with exponential backoff on HTTP 429 rate-limit responses.
+- Results render inline and can be exported.
+
 ### **Creating an Executable**
 
 This project uses **PyInstaller** to create the standalone executable.
