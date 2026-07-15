@@ -1034,6 +1034,63 @@ def download_card_direct():
         token_button.config(state=NORMAL)
         select_output_button.config(state=NORMAL)
 
+def download_card_image(node, card_dir, sanitized_name, headers, status_var, batch_prefix="", suppress_popup=False):
+    """Download the card's main image, with fallbacks for broken Chub CDN URLs.
+
+    Chub's API sometimes returns a stale max_res_url with a typo in the
+    filename ('chara_char_v2.png' instead of 'chara_card_v2.png'). When the
+    primary URL 404s we try that substitution, then fall back to avatar_url.
+    Returns True on success, False if all attempts failed.
+    """
+    candidates = []
+    max_res_url = node.get('max_res_url')
+    avatar_url = node.get('avatar_url')
+    if max_res_url:
+        candidates.append(max_res_url)
+        # Known Chub CDN typo/stale URL: chara_char_v2 -> chara_card_v2
+        if 'chara_char_v2' in max_res_url:
+            candidates.append(max_res_url.replace('chara_char_v2', 'chara_card_v2'))
+    if avatar_url and avatar_url not in candidates:
+        candidates.append(avatar_url)
+
+    if not candidates:
+        msg = "Could not find 'max_res_url' or 'avatar_url' for the selected card to download the image."
+        logging.error(msg + f" Card: {node.get('fullPath') or node.get('path')}")
+        if not suppress_popup:
+            messagebox.showerror("Download Error", msg)
+        return False
+
+    last_error = None
+    for url in candidates:
+        status_var.set(f"{batch_prefix}Downloading card image from {url[:50]}...")
+        try:
+            image_response = request_with_retry(url, headers=headers, timeout=30, stream=True, status_var=status_var, context_label=batch_prefix)
+            if image_response.status_code == 404:
+                logging.warning(f"Card image 404 at {url}; trying next candidate...")
+                last_error = f"404 Not Found for url: {url}"
+                continue
+            image_response.raise_for_status()
+            # Preserve the remote extension when falling back to avatar.webp etc.
+            ext = os.path.splitext(url.split('?')[0])[1] or '.png'
+            out_path = os.path.join(card_dir, f"{sanitized_name}{ext}")
+            with open(out_path, 'wb') as img_file:
+                for chunk in image_response.iter_content(chunk_size=8192):
+                    img_file.write(chunk)
+            if url != max_res_url:
+                logging.info(f"Downloaded card image via fallback URL: {url}")
+            status_var.set(f"{batch_prefix}Card image downloaded.")
+            return True
+        except requests.exceptions.RequestException as img_err:
+            logging.warning(f"Failed to download card image from {url}: {img_err}")
+            last_error = str(img_err)
+            continue
+
+    logging.error(f"All card image candidates failed for {node.get('fullPath') or node.get('name')}: {last_error}")
+    if not suppress_popup:
+        messagebox.showerror("Image Download Error", f"Failed to download card image: {last_error}")
+    return False
+
+
 def download_card_thread(node, bundle_option, output_directory, headers, ai_rating, status_var, ui_callback=None, suppress_popup=False, batch_prefix=""):
     try:
         # Check if a card was actually selected/found before proceeding
@@ -1059,23 +1116,8 @@ def download_card_thread(node, bundle_option, output_directory, headers, ai_rati
         if not os.path.exists(card_dir):
             os.makedirs(card_dir)
 
-        # Download PNG using max_res_url from the search result node
-        max_res_url = node.get('max_res_url')
-        if not max_res_url:
-            messagebox.showerror("Download Error", "Could not find 'max_res_url' for the selected card to download the image.")
-            logging.error(f"max_res_url not found for card {full_path}")
-        else:
-            status_var.set(f"{batch_prefix}Downloading card image from {max_res_url[:50]}...")
-            try:
-                image_response = request_with_retry(max_res_url, headers=headers, timeout=30, stream=True, status_var=status_var, context_label=batch_prefix)
-                image_response.raise_for_status()
-                with open(os.path.join(card_dir, f"{sanitized_name}.png"), 'wb') as img_file:
-                    for chunk in image_response.iter_content(chunk_size=8192):
-                        img_file.write(chunk)
-                status_var.set(f"{batch_prefix}Card image downloaded.")
-            except requests.exceptions.RequestException as img_err:
-                messagebox.showerror("Image Download Error", f"Failed to download card image from {max_res_url}: {img_err}")
-                logging.error(f"Failed to download card image from {max_res_url}: {img_err}")
+        # Download PNG using max_res_url (with CDN typo / avatar fallbacks)
+        download_card_image(node, card_dir, sanitized_name, headers, status_var, batch_prefix=batch_prefix, suppress_popup=suppress_popup)
 
         # Third API call to get gallery images
         logging.info(f"Attempting to fetch gallery for card_id: {card_id}")
@@ -1293,10 +1335,26 @@ def download_all_own_cards():
             status_var.set("No own bots found. Ready.")
             return
 
+        # The user-projects endpoint can also return lorebooks / presets / other
+        # project types that aren't character cards. Keep only characters.
+        total_projects = len(nodes)
+        nodes = [
+            n for n in nodes
+            if (n.get('projectSpace') or 'characters').lower() == 'characters'
+        ]
+        skipped_non_chars = total_projects - len(nodes)
+        if skipped_non_chars:
+            logging.info(f"Filtered out {skipped_non_chars} non-character project(s) (lorebooks/presets/etc).")
+
+        if not nodes:
+            messagebox.showinfo("No Bots Found", f"No character bots were found for the account '{creator}'.")
+            status_var.set("No own character bots found. Ready.")
+            return
+
         # Confirm before downloading a potentially large batch.
         confirm = messagebox.askyesno(
             "Download All Own Bots",
-            f"Found {len(nodes)} bot(s) for '{creator}'.\n\nDownload all of them to:\n{output_directory}\n?",
+            f"Found {len(nodes)} character bot(s) for '{creator}'.\n\nDownload all of them to:\n{output_directory}\n?",
         )
         if not confirm:
             status_var.set("Download cancelled. Ready.")
@@ -1877,7 +1935,7 @@ status_bar = ttk.Label(app, textvariable=status_var, relief=SUNKEN, anchor=W, fo
 status_bar.pack(side=BOTTOM, fill=X)
 
 # Version label in lower right corner
-version_label = ttk.Label(app, text="v1.8.0", font=('Segoe UI', 8))
+version_label = ttk.Label(app, text="v1.8.1", font=('Segoe UI', 8))
 version_label.place(relx=1.0, rely=1.0, x=-5, y=-5, anchor='se')
 
 # Run the application

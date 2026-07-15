@@ -57,9 +57,15 @@ coverage.xml
 
 # Application-specific logs
 error.log
+logs/
+
+# Stats server: local config + database (contain tokens / local data)
+stats_config.ini
+stats.db
 
 # Configuration files with secrets
 config.ini
+*.ini.local
 .pytest_cache/
 cover/
 

@@ -1,5 +1,17 @@
 # Patch Notes
 
+## v1.8.1
+
+### Bug Fixes
+
+- **Broken card images (404 on `chara_char_v2.png`)**: Older Chub CDN URLs returned by the API use a typo (`chara_char_v2.png` instead of `chara_card_v2.png`). The downloader now auto-retries with the corrected filename, then falls back to `avatar_url` if needed.
+- **Download All Own Bots no longer includes lorebooks/presets**: Only projects with `projectSpace == characters` are downloaded, so non-card projects no longer trigger image errors.
+- **Batch mode no longer spam-pops image error dialogs**: Failures during "Download All Own Bots" are logged instead of showing a messagebox per card.
+
+### Other
+
+- Expanded `.gitignore` to cover `stats_config.ini`, `stats.db`, and the `logs/` folder (in addition to the existing `config.ini`, `*.log`, `build/`, and `dist/`).
+
 ## v1.8.0
 
 ### New Features
